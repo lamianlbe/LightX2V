@@ -304,14 +304,20 @@ install_fa4() {
     # Published wheel, not a source build -- this is the fast one (seconds, not
     # the 20-60 min a FlashAttention 2 source build costs). The kernels are
     # CuTe-DSL and JIT at first use.
+    # flash-attn-4 has only ever published pre-releases (4.0.0bNN), and pip
+    # skips those by default -- a bare `pip install flash-attn-4` fails with
+    # "No matching distribution found". The `>=4.0.0b0` floor is what makes
+    # them eligible: per PEP 440 a specifier that names a pre-release enables
+    # them FOR THAT REQUIREMENT ONLY, which is tighter than a blanket --pre
+    # that would also let every transitive dep go pre-release.
     # The cu13 extra tracks the CUDA runtime the CuTe kernels JIT against,
     # which comes from torch -- not from the local nvcc.
     if [[ "${CUDA_TARGET}" == 13.* ]]; then
         log "FlashAttention 4 (CuTe DSL, cu13 extra for CUDA ${CUDA_TARGET})"
-        run_sh "${PIP} install 'flash-attn-4[cu13]'"
+        run_sh "${PIP} install 'flash-attn-4[cu13]>=${FLASH_ATTN_4_VERSION:-4.0.0b0}'"
     else
         log "FlashAttention 4 (CuTe DSL, CUDA ${CUDA_TARGET:-unknown})"
-        run_sh "${PIP} install flash-attn-4"
+        run_sh "${PIP} install 'flash-attn-4>=${FLASH_ATTN_4_VERSION:-4.0.0b0}'"
     fi
     ok "flash_attn4 (attn_type=flash_attn4 / spas_flash_attn4)"
 }
