@@ -328,12 +328,71 @@ def derive_audio_geometry(audio_cfg: dict) -> Dict[str, object]:
     }
 
 
+def official_upscaler_config(cfg: dict) -> dict:
+    """Normalise a diffusers upscaler config onto the official file's shape.
+
+    An official ltx-2.3-spatial-upscaler-*.safetensors carries exactly:
+
+        {"_class_name": "LatentUpsampler", "in_channels", "mid_channels",
+         "num_blocks_per_stage", "dims", "spatial_upsample",
+         "temporal_upsample", "spatial_scale", "rational_resampler"}
+
+    A diffusers export says ``LTX2LatentUpsampler`` and, for the x2 model, omits
+    ``spatial_scale`` / ``rational_resampler`` entirely -- the PixelShuffle
+    branch is implied. Both are recoverable rather than invented: the omission
+    IS the 2.0 PixelShuffle case, which is what LatentUpsampler falls back to.
+    """
+    cfg = dict(cfg)
+    if "rational_spatial_scale" in cfg and "spatial_scale" not in cfg:
+        cfg["spatial_scale"] = cfg.pop("rational_spatial_scale")
+    cfg["_class_name"] = "LatentUpsampler"
+    cfg.setdefault("rational_resampler", "spatial_scale" in cfg)
+    cfg.setdefault("spatial_scale", 2.0)
+    order = ["_class_name", "in_channels", "mid_channels", "num_blocks_per_stage", "dims", "spatial_upsample", "temporal_upsample", "spatial_scale", "rational_resampler"]
+    return {k: cfg[k] for k in order if k in cfg} | {k: v for k, v in cfg.items() if k not in order}
+
+
 def load_json(path: Path) -> dict:
     with open(path) as f:
         return json.load(f)
 
 
-def build_main_metadata(src: Path) -> Dict[str, str]:
+SHAPE_BEARING_KEYS = ["num_layers", "in_channels", "out_channels", "num_attention_heads", "attention_head_dim", "caption_channels", "cross_attention_dim"]
+
+
+def reference_metadata(path: Path, source_transformer: dict) -> Dict[str, object]:
+    """``config`` blocks of an official checkpoint, if it describes this架构.
+
+    The diffusers export only carries a 33-key transformer config where an
+    official release has 59, and no scheduler block at all -- those keys cannot
+    be reconstructed, only copied. This lifts them from a real official file.
+
+    Refuses when the reference describes a different architecture: every
+    shape-bearing key both sides declare must agree, otherwise the metadata
+    would describe weights it does not match.
+    """
+    with open(path, "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(n))
+    meta = header.get("__metadata__") or {}
+    if "config" not in meta:
+        raise SystemExit(f"--metadata-from: {path} has no __metadata__['config']")
+    ref = json.loads(meta["config"])
+    ref_tf = ref.get("transformer", {})
+
+    mismatched = {k: (ref_tf[k], source_transformer[k]) for k in SHAPE_BEARING_KEYS if k in ref_tf and k in source_transformer and ref_tf[k] != source_transformer[k]}
+    if mismatched:
+        detail = ", ".join(f"{k}: reference={a} source={b}" for k, (a, b) in mismatched.items())
+        raise SystemExit(f"--metadata-from: {path} describes a different architecture ({detail}). Refusing to copy its metadata onto these weights.")
+
+    lifted = {k: v for k, v in ref.items() if k in ("transformer", "scheduler")}
+    extras = {k: v for k, v in meta.items() if k in ("model_version",)}
+    print(f"  lifted from {path.name}: config blocks {sorted(lifted)}, metadata {sorted(extras) or '[]'}")
+    print(f"    transformer: {len(ref_tf)} keys (source has {len(source_transformer)}); shape-bearing keys agree")
+    return {"config_blocks": lifted, "metadata": extras}
+
+
+def build_main_metadata(src: Path, reference: Optional[Path] = None) -> Dict[str, str]:
     """Assemble the ``config`` metadata blob the component loaders require."""
     merged: Dict[str, object] = {}
     for name in CONFIG_COMPONENTS:
@@ -355,9 +414,15 @@ def build_main_metadata(src: Path) -> Dict[str, str]:
                 merged[name] = cfg if name in cfg else {name: cfg}[name]
                 break
 
-    metadata = {"config": json.dumps(merged)}
+    extra_metadata: Dict[str, str] = {}
+    if reference is not None:
+        lifted = reference_metadata(reference, merged.get("transformer", {}))
+        merged.update(lifted["config_blocks"])
+        extra_metadata.update({k: str(v) for k, v in lifted["metadata"].items()})
+
+    metadata = {"config": json.dumps(merged), **extra_metadata}
     index = src / "model_index.json"
-    if index.exists():
+    if index.exists() and "model_version" not in metadata:
         version = load_json(index).get("_diffusers_version")
         if version:
             metadata["source_diffusers_version"] = str(version)
@@ -517,6 +582,13 @@ def main() -> int:
     p.add_argument("--skip-upscalers", action="store_true", help="do not emit the spatial upscaler files")
     p.add_argument("--verify-only", action="store_true", help="only re-check an existing output directory")
     p.add_argument("--overwrite", action="store_true", help="overwrite existing output files")
+    p.add_argument(
+        "--metadata-from",
+        type=Path,
+        help="official LTX-2.x checkpoint to lift the transformer/scheduler config blocks and model_version from. "
+        "A diffusers export carries a reduced transformer config (33 keys vs 59) and no scheduler block; those can "
+        "only be copied, not reconstructed. Refused if the reference describes a different architecture.",
+    )
     args = p.parse_args()
 
     if args.verify_only:
@@ -537,7 +609,7 @@ def main() -> int:
     print(f"  {'TOTAL':28} {len(refs):5d} tensors  {total_gb:7.2f} GB")
 
     print("\nAssembling config metadata")
-    metadata = build_main_metadata(args.src)
+    metadata = build_main_metadata(args.src, args.metadata_from)
     print(f"  config keys: {sorted(json.loads(metadata['config']))}")
 
     print(f"\nWriting merged checkpoint -> {main_path}")
@@ -555,7 +627,7 @@ def main() -> int:
                 continue
             print(f"\nWriting upscaler -> {up_path}")
             up_refs = collect(args.src, [(subdir, [("", "")])])
-            up_meta = {"config": json.dumps(load_json(sub / "config.json"))}
+            up_meta = {"config": json.dumps(official_upscaler_config(load_json(sub / "config.json")))}
             write_safetensors(up_path, up_refs, up_meta)
 
     # set_config reads <model_path>/config.json and merges it AFTER the user's
