@@ -297,6 +297,37 @@ def build_main_metadata(src: Path) -> Dict[str, str]:
     return {"config": json.dumps(merged)}
 
 
+def warn_if_stale_gemma_layout(gemma_dir: Path) -> None:
+    """Flag a Gemma checkpoint whose keys predate the transformers VLM rename.
+
+    transformers moved Gemma3's keys under a ``model.`` root during its VLM
+    standardisation. An older export (``language_model.model.*``,
+    ``vision_tower.vision_model.*``) loaded into a transformers that has dropped
+    the compatibility shim produces no error -- every tensor is UNEXPECTED,
+    every parameter is MISSING, and the text encoder is silently randomly
+    initialised, so generation ignores the prompt. Worth catching here rather
+    than in a load report nobody reads.
+    """
+    index = gemma_dir / "model.safetensors.index.json"
+    if not index.exists():
+        return
+    try:
+        with open(index) as f:
+            keys = list(json.load(f)["weight_map"])
+    except Exception:  # noqa: BLE001 - advisory only
+        return
+    if not keys or any(k.startswith("model.") for k in keys):
+        return
+    stale = sorted({k.split(".")[0] for k in keys})
+    print(
+        f"\n  WARNING: {gemma_dir} uses the pre-rename Gemma key layout (top-level: {stale}).\n"
+        f"           Recent transformers expects everything under a 'model.' root. Loading as-is\n"
+        f"           randomly initialises the text encoder WITHOUT failing, which looks like a\n"
+        f"           working run that ignores the prompt. Check and fix with:\n"
+        f"             python tools/convert/ltx2_remap_gemma.py --src {gemma_dir} --dry-run\n"
+    )
+
+
 def link_or_copy(src_dir: Path, dst: Path, mode: str) -> None:
     if dst.exists() or dst.is_symlink():
         print(f"  gemma: {dst} already exists, leaving as-is")
@@ -397,6 +428,7 @@ def verify(out: Path, name: str) -> int:
     if not list(gemma.rglob("model*.safetensors")):
         print("  FAIL gemma/ has no model*.safetensors")
         problems += 1
+    warn_if_stale_gemma_layout(gemma)
 
     print(f"\n{'PASS - conversion looks complete' if problems == 0 else f'{problems} PROBLEM(S) FOUND'}")
     return 0 if problems == 0 else 1
@@ -471,7 +503,9 @@ def main() -> int:
         print(f"  note: derived {scale_factors} rather than the stock LTX-2 [8, 32, 32] -- double-check the VAE's encoder_blocks if that is unexpected")
 
     if args.gemma != "skip":
-        link_or_copy(args.src / "text_encoder" / "gemma", args.out / "gemma", args.gemma)
+        gemma_src = args.src / "text_encoder" / "gemma"
+        link_or_copy(gemma_src, args.out / "gemma", args.gemma)
+        warn_if_stale_gemma_layout(gemma_src)
 
     # A ready-to-run LightX2V config. gemma_original_ckpt is set explicitly
     # because the default resolution rglobs model_path for model*.safetensors,
