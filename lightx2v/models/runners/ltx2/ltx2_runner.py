@@ -107,6 +107,7 @@ class LTX2Runner(DefaultRunner):
     def __init__(self, config):
         super().__init__(config)
         self._upsample_scale_cache = None
+        self._vae_scale_factors_cache = None
 
     # ------------------------------------------------------------------
     # Two-stage geometry
@@ -153,6 +154,27 @@ class LTX2Runner(DefaultRunner):
         return self._upsample_scale_cache
 
     @property
+    def vae_scale_factors(self) -> tuple:
+        """(time, height, width) VAE downscale, resolved once.
+
+        Normally supplied by ``<model_path>/config.json``. The scheduler already
+        tolerates its absence via the same chain, so match that instead of
+        letting a direct subscript raise KeyError -- but log the fallback, since
+        a wrong value silently mis-shapes every latent.
+        """
+        if self._vae_scale_factors_cache is None:
+            factors = self.config.get("vae_scale_factors") or self.config.get("video_scale_factors")
+            if factors is None:
+                factors = (8, 32, 32)
+                logger.warning(
+                    f"config has neither vae_scale_factors nor video_scale_factors; assuming {factors} "
+                    "(the stock LTX-2 geometry: H/32, W/32, 1 + (F-1)/8). Set vae_scale_factors explicitly "
+                    "if this model differs -- tools/convert/ltx2_diffusers_to_lightx2v.py writes it into config.json."
+                )
+            self._vae_scale_factors_cache = tuple(int(x) for x in factors)
+        return self._vae_scale_factors_cache
+
+    @property
     def stage1_size_alignment(self) -> int:
         """Multiple that stage-1 pixel H/W must land on.
 
@@ -160,7 +182,7 @@ class LTX2Runner(DefaultRunner):
         has to be divisible by ``den`` for the result to stay integral. In pixel
         terms that is ``vae_spatial_stride * den`` (32 for x2, 64 for x1.5).
         """
-        vae_spatial = int(self.config["vae_scale_factors"][1])
+        vae_spatial = int(self.vae_scale_factors[1])
         if not self.config.get("use_upsampler", False):
             return vae_spatial
         _, den = rational_for_scale(self.upsample_spatial_scale)
@@ -481,9 +503,9 @@ class LTX2Runner(DefaultRunner):
         target_video_length = self.input_info.target_video_length or self.config["target_video_length"]
         video_latent_shape = (
             self.config.get("num_channels_latents", 128),
-            (target_video_length - 1) // self.config["vae_scale_factors"][0] + 1,
-            int(target_height) // self.config["vae_scale_factors"][1],
-            int(target_width) // self.config["vae_scale_factors"][2],
+            (target_video_length - 1) // self.vae_scale_factors[0] + 1,
+            int(target_height) // self.vae_scale_factors[1],
+            int(target_width) // self.vae_scale_factors[2],
         )
 
         duration = float(target_video_length) / float(self.config["fps"])
@@ -868,7 +890,7 @@ class LTX2Runner(DefaultRunner):
         strengths = _ltx2_normalize_image_strengths(self.input_info.image_strength, n)
         raw_frame_idx = getattr(self.input_info, "image_frame_idx", None)
         pixel_frame_indices = _ltx2_resolve_pixel_frame_indices(raw_frame_idx, n, num_frames)
-        temporal_scale = int(self.config["vae_scale_factors"][0])
+        temporal_scale = int(self.vae_scale_factors[0])
 
         guiding_keyframe_meta: list[tuple[str, int, float]] = []
         self._i2av_first_frame_meta = None

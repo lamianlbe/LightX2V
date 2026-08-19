@@ -250,6 +250,32 @@ def write_safetensors(out_path: Path, refs: List[TensorRef], metadata: Dict[str,
     tmp.replace(out_path)
 
 
+def derive_vae_scale_factors(vae_cfg: dict) -> List[int]:
+    """(time, height, width) downscale of the LTX video VAE, from its own config.
+
+    Per ``video_vae.py``: ``patch_size`` sets the initial spatial patchify, then
+    each ``compress_*`` block halves the axes it names -- ``compress_time*``
+    temporal, ``compress_space*`` spatial, ``compress_all*`` both. ``multiplier``
+    in those blocks is the CHANNEL multiplier and does not affect geometry.
+    A stock LTX-2 VAE works out to [8, 32, 32] (H/32, W/32, 1 + (F-1)/8).
+
+    This is derived rather than hardcoded because it is the one value that,
+    if wrong, produces silently mis-shaped latents.
+    """
+    spatial = int(vae_cfg.get("patch_size", 4))
+    temporal = 1
+    for entry in vae_cfg.get("encoder_blocks", []):
+        name = entry[0] if isinstance(entry, (list, tuple)) else entry
+        if name.startswith("compress_time"):
+            temporal *= 2
+        elif name.startswith("compress_space"):
+            spatial *= 2
+        elif name.startswith("compress_all"):
+            spatial *= 2
+            temporal *= 2
+    return [temporal, spatial, spatial]
+
+
 def load_json(path: Path) -> dict:
     with open(path) as f:
         return json.load(f)
@@ -358,7 +384,10 @@ def verify(out: Path, name: str) -> int:
         problems += 1
     else:
         arch = load_json(cfg_json)
-        print(f"  config.json: num_layers={arch.get('num_layers')} in_channels={arch.get('in_channels')}")
+        print(f"  config.json: num_layers={arch.get('num_layers')} in_channels={arch.get('in_channels')} vae_scale_factors={arch.get('vae_scale_factors')}")
+        if not arch.get("vae_scale_factors"):
+            print("  FAIL config.json has no vae_scale_factors -- the runner indexes it directly and will KeyError")
+            problems += 1
 
     gemma = out / "gemma"
     for probe in ("tokenizer.model", "preprocessor_config.json"):
@@ -423,11 +452,23 @@ def main() -> int:
             up_meta = {"config": json.dumps(load_json(sub / "config.json"))}
             write_safetensors(up_path, up_refs, up_meta)
 
-    # set_config reads the DiT architecture from <model_path>/config.json.
+    # set_config reads <model_path>/config.json and merges it AFTER the user's
+    # --config_json, so this file is authoritative. The diffusers export splits
+    # its configs per component, which means the transformer config alone is
+    # missing the pipeline-level geometry the runner indexes directly --
+    # notably vae_scale_factors, whose absence is a hard KeyError in
+    # get_latent_shape_with_target_hw. Fold it in here.
     arch = load_json(args.src / "transformer" / "config.json")
+    vae_cfg = load_json(args.src / "vae" / "config.json")
+    vae_cfg = vae_cfg.get("vae", vae_cfg)
+    scale_factors = derive_vae_scale_factors(vae_cfg)
+    arch["vae_scale_factors"] = scale_factors
+    arch.setdefault("vae_stride", scale_factors)
     with open(args.out / "config.json", "w") as f:
         json.dump(arch, f, indent=2)
-    print(f"\nWrote {args.out / 'config.json'} (DiT architecture, num_layers={arch.get('num_layers')})")
+    print(f"\nWrote {args.out / 'config.json'} (DiT architecture, num_layers={arch.get('num_layers')}, vae_scale_factors={scale_factors})")
+    if scale_factors != [8, 32, 32]:
+        print(f"  note: derived {scale_factors} rather than the stock LTX-2 [8, 32, 32] -- double-check the VAE's encoder_blocks if that is unexpected")
 
     if args.gemma != "skip":
         link_or_copy(args.src / "text_encoder" / "gemma", args.out / "gemma", args.gemma)

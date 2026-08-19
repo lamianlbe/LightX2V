@@ -293,7 +293,17 @@ install_core() {
     run mkdir -p "${BUILD_DIR}"
     run_sh "grep -v -E '^[[:space:]]*sgl-kernel([[:space:]]|==|>=|<=|$)' '${REPO_ROOT}/requirements.txt' > '${req}'"
     run_sh "${PIP} install -r '${req}'"
-    ok "core (pyproject + requirements.txt, minus the renamed sgl-kernel)"
+
+    # Runtime imports that neither pyproject nor requirements.txt declares,
+    # though upstream's own images install them:
+    #   torchcodec  torchaudio 2.9+ delegates decoding to it; without it
+    #               lightx2v/utils/audio_io.py falls through to soundfile
+    #   soundfile   that fallback decoder (and the only one on some hosts)
+    #   Pillow      imported unconditionally as PIL by ltx2_media_io; today it
+    #               only arrives transitively via torchvision
+    #   librosa     audio feature extraction on the Wan audio paths
+    run_sh "${PIP} install soundfile torchcodec Pillow librosa"
+    ok "core (pyproject + requirements.txt + undeclared runtime imports)"
 }
 
 # ----------------------------------------------------------------------------
@@ -454,6 +464,9 @@ QUANT = [("sgl_kernel", "fp8-sgl / int8-sgl + fused RMSNorm"),
          ("vllm", "fp8-vllm / int8-vllm"),
          ("torchao", "fp8-torchao / int8-torchao"),
          ("gguf", "gguf-* schemes")]
+MEDIA = [("soundfile", "audio decode fallback for torchaudio 2.9+"),
+         ("torchcodec", "torchaudio 2.9+ primary decoder"),
+         ("librosa", "audio features (Wan audio paths)")]
 
 def check(group, items, required):
     print(f"\n  {group}")
@@ -472,6 +485,7 @@ def check(group, items, required):
 missing_core = check("core", CORE, True)
 attn_missing = check("attention operators (optional)", ATTN, False)
 check("quantization operators (optional)", QUANT, False)
+check("media codecs", MEDIA, False)
 
 print()
 if missing_core:

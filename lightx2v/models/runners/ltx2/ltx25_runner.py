@@ -159,10 +159,10 @@ class LTX25Runner(LTX2Runner):
         if seq_p_size <= 1:
             return
 
-        latent_frames = (num_frames - 1) // int(self.config["vae_scale_factors"][0]) + 1
+        latent_frames = (num_frames - 1) // int(self.vae_scale_factors[0]) + 1
         stage1_height, stage1_width = map(int, self.input_info.target_shape)
         stage2_height, stage2_width = self.stage2_hw_from_stage1(stage1_height, stage1_width)
-        spatial_stride = int(self.config["vae_scale_factors"][1])
+        spatial_stride = int(self.vae_scale_factors[1])
         stage_token_counts = {
             "stage 1": (latent_frames + guiding_keyframes) * (stage1_height // spatial_stride) * (stage1_width // spatial_stride),
             "stage 2": (latent_frames + guiding_keyframes) * (stage2_height // spatial_stride) * (stage2_width // spatial_stride),
