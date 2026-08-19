@@ -12,7 +12,10 @@ from lightx2v.models.video_encoders.hf.ltx2.audio_vae.model_configurator import 
     VocoderConfigurator,
 )
 from lightx2v.models.video_encoders.hf.ltx2.audio_vae.vocoder import Vocoder, VocoderWithBWE
-from lightx2v.models.video_encoders.hf.ltx2.upsampler.model import LatentUpsamplerConfigurator
+from lightx2v.models.video_encoders.hf.ltx2.upsampler.model import (
+    LatentUpsamplerConfigurator,
+    effective_spatial_scale_from_config,
+)
 from lightx2v.models.video_encoders.hf.ltx2.video_vae.diffusion_video_decoder import DiffusionVideoDecoder
 from lightx2v.models.video_encoders.hf.ltx2.video_vae.model_configurator import (
     VAE_DECODER_COMFY_KEYS_FILTER,
@@ -345,7 +348,19 @@ class LTX2Upsampler:
         self.cpu_offload = cpu_offload
         self.loader = None
         self.upsampler = None
+        self.spatial_scale = 2.0
         self.load()
+
+    @staticmethod
+    def probe_spatial_scale(checkpoint_path: str) -> float:
+        """Read the upsampler's spatial scale from the checkpoint metadata only.
+
+        Reads the safetensors header, not the tensors, so callers can size the
+        two-stage pipeline before the upsampler is built (or on a rank that
+        never builds it).
+        """
+        config = SafetensorsModelStateDictLoader().metadata(checkpoint_path)
+        return effective_spatial_scale_from_config(config)
 
     def load(self):
         """
@@ -363,9 +378,10 @@ class LTX2Upsampler:
         self.loader = SafetensorsModelStateDictLoader()
         config = self.loader.metadata(self.checkpoint_path)
 
-        # Handle config format: may have rational_spatial_scale instead of spatial_scale
-        if "rational_spatial_scale" in config and "spatial_scale" not in config:
-            config["spatial_scale"] = config["rational_spatial_scale"]
+        # ``rational_spatial_scale`` -> ``spatial_scale`` normalization and the
+        # PixelShuffle-vs-rational distinction both live in the configurator's
+        # module so the runner can ask the same question off metadata alone.
+        self.spatial_scale = effective_spatial_scale_from_config(config)
 
         # Create model on meta device (aligned with Builder.meta_model line 47-48)
         with torch.device("meta"):
@@ -412,7 +428,7 @@ class LTX2Upsampler:
             video_encoder: VideoEncoder with per_channel_statistics for normalization.
 
         Returns:
-            Upsampled latent tensor of shape [B, C, F, H*2, W*2] or [C, F, H*2, W*2].
+            Upsampled latent tensor, spatially scaled by ``self.spatial_scale``.
         """
 
         try:

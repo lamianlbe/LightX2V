@@ -14,6 +14,10 @@ from lightx2v.models.schedulers.ltx2.scheduler import LTX2ARScheduler, LTX2Sched
 from lightx2v.models.video_encoders.hf.ltx2.audio_vae.audio_vae import encode_audio
 from lightx2v.models.video_encoders.hf.ltx2.audio_vae.ops import Audio
 from lightx2v.models.video_encoders.hf.ltx2.model import LTX2AudioVAE, LTX2Upsampler, LTX2VideoVAE
+from lightx2v.models.video_encoders.hf.ltx2.upsampler.spatial_rational_resampler import (
+    SUPPORTED_RATIONAL_SCALES,
+    rational_for_scale,
+)
 from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import *
 from lightx2v.utils.input_info import I2AVInputInfo, T2AVInputInfo
@@ -102,6 +106,115 @@ class LTX2Runner(DefaultRunner):
 
     def __init__(self, config):
         super().__init__(config)
+        self._upsample_scale_cache = None
+
+    # ------------------------------------------------------------------
+    # Two-stage geometry
+    #
+    # The spatial upscaler ships in several ratios (x2 PixelShuffle, and the
+    # rational resampler at x1.5 / x2 / x4). ``target_height`` / ``target_width``
+    # in the config are always the FINAL resolution, so stage 1 runs at
+    # ``final / scale`` and stage 2 scales back up. Every ratio-dependent size
+    # goes through the three helpers below -- do not hardcode 2 anywhere.
+    # ------------------------------------------------------------------
+
+    @property
+    def upsample_spatial_scale(self) -> float:
+        """Spatial scale of the configured upscaler; 1.0 when stage 2 is off.
+
+        Resolution order: explicit ``upsampler_spatial_scale`` config override,
+        then the checkpoint's own metadata, then 2.0 with a warning.
+        """
+        if self._upsample_scale_cache is not None:
+            return self._upsample_scale_cache
+
+        if not self.config.get("use_upsampler", False):
+            self._upsample_scale_cache = 1.0
+            return self._upsample_scale_cache
+
+        override = self.config.get("upsampler_spatial_scale")
+        if override is not None:
+            scale = float(override)
+            logger.info(f"Upsampler spatial scale {scale}x (from upsampler_spatial_scale config override)")
+        else:
+            ckpt = self.config.get("upsampler_original_ckpt") or os.path.join(self.config["model_path"], "latent_upsampler")
+            try:
+                scale = LTX2Upsampler.probe_spatial_scale(ckpt)
+                logger.info(f"Upsampler spatial scale {scale}x (probed from {ckpt})")
+            except Exception as e:  # noqa: BLE001 - never let a metadata probe break inference.
+                scale = 2.0
+                logger.warning(f"Could not probe upsampler spatial scale from {ckpt!r} ({e}); assuming {scale}x. Set upsampler_spatial_scale to override.")
+
+        if scale not in SUPPORTED_RATIONAL_SCALES:
+            raise ValueError(f"Unsupported upsampler spatial scale {scale}. Choose from {sorted(SUPPORTED_RATIONAL_SCALES)}")
+        if scale <= 1.0:
+            raise ValueError(f"use_upsampler=True needs an upscaling ratio, got {scale}x. Use a x1.5/x2/x4 upsampler checkpoint.")
+        self._upsample_scale_cache = scale
+        return self._upsample_scale_cache
+
+    @property
+    def stage1_size_alignment(self) -> int:
+        """Multiple that stage-1 pixel H/W must land on.
+
+        Stage 2 multiplies the latent grid by ``num/den``, so the stage-1 grid
+        has to be divisible by ``den`` for the result to stay integral. In pixel
+        terms that is ``vae_spatial_stride * den`` (32 for x2, 64 for x1.5).
+        """
+        vae_spatial = int(self.config["vae_scale_factors"][1])
+        if not self.config.get("use_upsampler", False):
+            return vae_spatial
+        _, den = rational_for_scale(self.upsample_spatial_scale)
+        return vae_spatial * den
+
+    def stage1_hw_from_final(self, final_h: int, final_w: int) -> tuple[int, int]:
+        """Final (stage-2) resolution -> stage-1 resolution, snapped down to the grid."""
+        if not self.config.get("use_upsampler", False):
+            align = self.stage1_size_alignment
+            return (max(align, int(final_h) // align * align), max(align, int(final_w) // align * align))
+        num, den = rational_for_scale(self.upsample_spatial_scale)
+        align = self.stage1_size_alignment
+        base_h = max(align, int(final_h) * den // num // align * align)
+        base_w = max(align, int(final_w) * den // num // align * align)
+        return base_h, base_w
+
+    def stage2_hw_from_stage1(self, base_h: int, base_w: int) -> tuple[int, int]:
+        """Stage-1 resolution -> stage-2 (final) resolution."""
+        if not self.config.get("use_upsampler", False):
+            return int(base_h), int(base_w)
+        num, den = rational_for_scale(self.upsample_spatial_scale)
+        if int(base_h) % den or int(base_w) % den:
+            raise ValueError(f"Stage-1 size {base_w}x{base_h} is not divisible by {den}; cannot apply a {self.upsample_spatial_scale}x upscale exactly.")
+        return int(base_h) * num // den, int(base_w) * num // den
+
+    def validate_sampler_config(self) -> None:
+        """Fail fast on impossible sampler/schedule pairs, before weights load.
+
+        ``LTX2Scheduler.prepare`` re-checks per stage, but stage 2 only prepares
+        after stage 1 has already run, so a bad stage-2 sampler would otherwise
+        surface minutes into a job.
+        """
+        scheduler = self.scheduler
+        stage1_sigmas = self.config.get("distilled_sigma_values")
+        # Auto-generated LTX-2 schedules always start at exactly sigma = 1.0.
+        first_stage1 = float(stage1_sigmas[0]) if stage1_sigmas else 1.0
+        scheduler.check_sampler_schedule(scheduler.sampler_stage1, first_stage1, stage=1)
+
+        if self.config.get("use_upsampler", False):
+            stage2_sigmas = self.config.get("distilled_sigma_values_upsample")
+            if stage2_sigmas:
+                scheduler.check_sampler_schedule(scheduler.sampler_stage2, float(stage2_sigmas[0]), stage=2)
+
+        if scheduler.needs_uncond_pred or scheduler.sampler_stage2 in ("euler_ancestral_cfg_pp",):
+            if not (self.input_info.negative_prompt or "").strip():
+                logger.warning(
+                    "euler_ancestral_cfg_pp builds its direction term from the unconditional prediction, "
+                    "but the negative prompt is empty -- the extra forward is still paid and the result "
+                    "will differ from a ComfyUI graph that wires a real negative prompt."
+                )
+
+        logger.info(
+            f"LTX-2 samplers: stage1={scheduler.sampler_stage1}, stage2={scheduler.sampler_stage2}, eta={scheduler.sampler_eta}, s_noise={scheduler.sampler_s_noise}, repin={scheduler.repin_mode}"
+        )
 
     @ProfilingContext4DebugL1("Warmup")
     def run_warmup(self):
@@ -121,8 +234,6 @@ class LTX2Runner(DefaultRunner):
         stage1_infer_steps = scheduler.infer_steps
         use_upsampler = bool(self.config.get("use_upsampler"))
         model_offload = self.config.get("cpu_offload", False) and self.config.get("offload_granularity") == "model"
-        _, spatial_scale_h, spatial_scale_w = self.config["vae_scale_factors"]
-        upsample_scale = 2 if use_upsampler else 1
         stage_count = 2 if use_upsampler else 1
         warmup_resolutions = self._UPSAMPLER_WARMUP_RESOLUTIONS if use_upsampler else self._WARMUP_RESOLUTIONS
         text_encoder_output = None
@@ -131,10 +242,10 @@ class LTX2Runner(DefaultRunner):
 
         try:
             for requested_height, requested_width in warmup_resolutions:
-                height = max(1, requested_height // (spatial_scale_h * upsample_scale)) * spatial_scale_h
-                width = max(1, requested_width // (spatial_scale_w * upsample_scale)) * spatial_scale_w
+                height, width = self.stage1_hw_from_final(requested_height, requested_width)
                 if use_upsampler:
-                    logger.info(f"Warmup: requested {requested_height}x{requested_width}, aligned final {height * 2}x{width * 2} (base stage {height}x{width})")
+                    final_h, final_w = self.stage2_hw_from_stage1(height, width)
+                    logger.info(f"Warmup: requested {requested_height}x{requested_width}, aligned final {final_h}x{final_w} (base stage {height}x{width})")
                 elif (height, width) != (requested_height, requested_width):
                     logger.info(f"Warmup: requested {requested_height}x{requested_width}, aligned to {height}x{width}")
                 else:
@@ -349,12 +460,22 @@ class LTX2Runner(DefaultRunner):
             target_height = self.input_info.target_shape[0]
             target_width = self.input_info.target_shape[1]
         else:
+            target_height, target_width = self.stage1_hw_from_final(
+                self.config["target_height"],
+                self.config["target_width"],
+            )
             if self.config.get("use_upsampler", False):
-                target_height = self.config["target_height"] // 2
-                target_width = self.config["target_width"] // 2
-            else:
-                target_height = self.config["target_height"]
-                target_width = self.config["target_width"]
+                eff_h, eff_w = self.stage2_hw_from_stage1(target_height, target_width)
+                req_h = int(self.config["target_height"])
+                req_w = int(self.config["target_width"])
+                if (eff_h, eff_w) != (req_h, req_w):
+                    logger.warning(
+                        f"Requested {req_w}x{req_h} is not reachable with a {self.upsample_spatial_scale}x upscaler "
+                        f"(stage-1 must be a multiple of {self.stage1_size_alignment}); producing {eff_w}x{eff_h} "
+                        f"from stage-1 {target_width}x{target_height}."
+                    )
+                else:
+                    logger.info(f"Two-stage {self.upsample_spatial_scale}x: stage-1 {target_width}x{target_height} -> final {eff_w}x{eff_h}")
             self.input_info.target_shape = [target_height, target_width]
 
         target_video_length = self.input_info.target_video_length or self.config["target_video_length"]
@@ -482,10 +603,11 @@ class LTX2Runner(DefaultRunner):
         final_h, final_w = hw
 
         use_upsampler = bool(self.config.get("use_upsampler", False))
-        base_h = final_h // 2 if use_upsampler else final_h
-        base_w = final_w // 2 if use_upsampler else final_w
+        base_h, base_w = self.stage1_hw_from_final(final_h, final_w)
 
-        vae_spatial_scale = 32
+        # ``stage1_size_alignment`` already folds in the upscaler's denominator
+        # (32 for x2, 64 for x1.5), so the ref-downscale grid is layered on top.
+        vae_spatial_scale = self.stage1_size_alignment
         ref_factor = self._get_ref_downscale_factor()
         base_div = int(round(vae_spatial_scale / max(ref_factor, 1e-6)))
         if base_div % vae_spatial_scale != 0:
@@ -499,13 +621,13 @@ class LTX2Runner(DefaultRunner):
 
         old_h = int(self.config.get("target_height", 0) or 0)
         old_w = int(self.config.get("target_width", 0) or 0)
-        eff_final_h = base_h * 2 if use_upsampler else base_h
-        eff_final_w = base_w * 2 if use_upsampler else base_w
+        eff_final_h, eff_final_w = self.stage2_hw_from_stage1(base_h, base_w)
         logger.info(
             f"  ↪ v2av: output size from control video "
             f"(config {old_w}x{old_h} → final {eff_final_w}x{eff_final_h}, "
             f"base-gen {base_w}x{base_h}, base_div={base_div}, "
-            f"ref_downscale_factor={ref_factor}, use_upsampler={use_upsampler})."
+            f"ref_downscale_factor={ref_factor}, use_upsampler={use_upsampler}, "
+            f"upsample_scale={self.upsample_spatial_scale}x)."
         )
         self.input_info.target_shape = [base_h, base_w]
 
@@ -518,16 +640,12 @@ class LTX2Runner(DefaultRunner):
         self._normalize_i2av_input_fields()
         self._override_target_hw_from_ref_video()
         if not self.input_info.target_shape:
-            if self.config.get("use_upsampler", False):
-                self.input_info.target_shape = [
-                    self.config["target_height"] // 2,
-                    self.config["target_width"] // 2,
-                ]
-            else:
-                self.input_info.target_shape = [
+            self.input_info.target_shape = list(
+                self.stage1_hw_from_final(
                     self.config["target_height"],
                     self.config["target_width"],
-                ]
+                )
+            )
 
         # Reference/control video → pixel tensor, then align temporal length with
         # the clip (official-style: decode up to ``num_frames`` cap, actual length
@@ -927,6 +1045,9 @@ class LTX2Runner(DefaultRunner):
 
         upsample_distilled_sigmas = torch.tensor(self.config.get("distilled_sigma_values_upsample"), dtype=torch.float32, device=AI_DEVICE)
         self.model.scheduler.reset_sigmas(upsample_distilled_sigmas)
+        # Stage 2 may run a different sampler than stage 1 (e.g. plain
+        # euler_ancestral to generate, euler_ancestral_cfg_pp to refine).
+        self.model.scheduler.set_stage(2)
         if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
             self.upsampler = self.load_upsampler()
 
@@ -935,7 +1056,12 @@ class LTX2Runner(DefaultRunner):
             del self.upsampler
             self.maybe_empty_cache()
 
-        self.input_info.target_shape = [self.input_info.target_shape[0] * 2, self.input_info.target_shape[1] * 2]
+        self.input_info.target_shape = list(
+            self.stage2_hw_from_stage1(
+                self.input_info.target_shape[0],
+                self.input_info.target_shape[1],
+            )
+        )
         self.input_info.video_latent_shape, self.input_info.audio_latent_shape = self.get_latent_shape_with_target_hw()
         _, _, stage2_h, stage2_w = self.input_info.video_latent_shape
         stage2_video_denoise_mask = None
@@ -1051,6 +1177,10 @@ class LTX2Runner(DefaultRunner):
         if self.config.get("distilled_sigma_values") is not None:
             stage1_sigmas = torch.tensor(self.config["distilled_sigma_values"], dtype=torch.float32, device=AI_DEVICE)
             self.model.scheduler.reset_sigmas(stage1_sigmas)
+
+        # Select the stage-1 sampler before prepare() seeds its noise.
+        self.model.scheduler.set_stage(1)
+        self.validate_sampler_config()
 
         # Image conditioning (if any) is already prepared in run_input_encoder
         # and stored in self.video_denoise_mask and self.initial_video_latent
@@ -1217,6 +1347,12 @@ class LTX2ARRunner(LTX2Runner):
         chunk = int(self.config.get("ar_config", {}).get("num_frame_per_chunk", 0))
         if chunk <= 0:
             raise ValueError("ltx2_ar requires ar_config.num_frame_per_chunk > 0.")
+        # LTX2ARScheduler.step_post implements self-forcing renoise and never
+        # consults the sampler setting, so accepting one would silently lie.
+        for field in ("sampler", "sampler_stage1", "sampler_stage2"):
+            value = self.config.get(field)
+            if value is not None and value != "euler":
+                raise NotImplementedError(f"ltx2_ar uses self-forcing renoise and only supports {field}='euler', got {value!r}.")
 
     @staticmethod
     def _slice_latent_state(state, start, end, *, clone_latent=True):

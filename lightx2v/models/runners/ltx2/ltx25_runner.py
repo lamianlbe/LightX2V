@@ -12,6 +12,7 @@ from lightx2v.models.networks.ltx2.ltx25_model import LTX25Model
 from lightx2v.models.runners.ltx2.ltx2_runner import LTX2Runner
 from lightx2v.models.schedulers.ltx2.ltx25_scheduler import LTX25Scheduler
 from lightx2v.models.video_encoders.hf.ltx2.model import LTX25AudioVAE, LTX25VideoVAE
+from lightx2v.models.video_encoders.hf.ltx2.upsampler.spatial_rational_resampler import rational_for_scale
 from lightx2v.utils.envs import GET_DTYPE
 from lightx2v.utils.ltx2_media_io import encode_video_ltx25
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
@@ -132,9 +133,15 @@ class LTX25Runner(LTX2Runner):
         else:
             final_height = int(self.config["target_height"])
             final_width = int(self.config["target_width"])
-        if final_height % 64 != 0 or final_width % 64 != 0:
-            raise ValueError(f"LTX-2.5 distilled two-stage output height and width must be divisible by 64, got {final_height}x{final_width}")
-        self.input_info.target_shape = [final_height // 2, final_width // 2]
+        # Stage-1 must land on the VAE grid after dividing by the upscaler
+        # ratio, so the final size has to be divisible by scale * alignment
+        # (64 for the stock x2 upscaler, 96 for x1.5).
+        stage1_align = self.stage1_size_alignment
+        num, den = rational_for_scale(self.upsample_spatial_scale) if self.config.get("use_upsampler", False) else (1, 1)
+        final_align = stage1_align * num // den
+        if final_height % final_align != 0 or final_width % final_align != 0:
+            raise ValueError(f"LTX-2.5 two-stage output height and width must be divisible by {final_align} for a {self.upsample_spatial_scale}x upscaler, got {final_height}x{final_width}")
+        self.input_info.target_shape = list(self.stage1_hw_from_final(final_height, final_width))
 
     def _validate_sequence_parallel_shape(self, num_frames: int, guiding_keyframes: int = 0) -> None:
         """Reject SP layouts that would introduce unmasked video tokens.
@@ -154,10 +161,11 @@ class LTX25Runner(LTX2Runner):
 
         latent_frames = (num_frames - 1) // int(self.config["vae_scale_factors"][0]) + 1
         stage1_height, stage1_width = map(int, self.input_info.target_shape)
+        stage2_height, stage2_width = self.stage2_hw_from_stage1(stage1_height, stage1_width)
         spatial_stride = int(self.config["vae_scale_factors"][1])
         stage_token_counts = {
             "stage 1": (latent_frames + guiding_keyframes) * (stage1_height // spatial_stride) * (stage1_width // spatial_stride),
-            "stage 2": (latent_frames + guiding_keyframes) * (stage1_height * 2 // spatial_stride) * (stage1_width * 2 // spatial_stride),
+            "stage 2": (latent_frames + guiding_keyframes) * (stage2_height // spatial_stride) * (stage2_width // spatial_stride),
         }
         invalid = {name: count for name, count in stage_token_counts.items() if count % seq_p_size}
         if invalid:
@@ -200,13 +208,9 @@ class LTX25Runner(LTX2Runner):
         self.maybe_empty_cache()
         return {"text_encoder_output": text_encoder_output}
 
-    def init_run(self):
-        self.scheduler.set_stage(1)
-        return super().init_run()
-
-    def run_upsampler(self, v_latent, a_latent, prepare_only=False):
-        self.scheduler.set_stage(2)
-        return super().run_upsampler(v_latent, a_latent, prepare_only=prepare_only)
+    # NOTE: stage selection (set_stage(1) / set_stage(2)) now lives in
+    # LTX2Runner.init_run / run_upsampler, so both LTX-2.3 and LTX-2.5 pick
+    # up the per-stage sampler from one place.
 
     def process_images_after_vae_decoder(self):
         """Return/save the source-compatible float DiffVAE stream."""

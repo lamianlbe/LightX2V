@@ -389,11 +389,15 @@ class LTX2Model(BaseTransformerModel):
         v_skip = False if is_rerun else _mm_guider_should_skip_step(v_p["skip_step"], step_i)
         a_skip = False if is_rerun else _mm_guider_should_skip_step(a_p["skip_step"], step_i)
 
-        need_neg = (not math.isclose(v_p["cfg_scale"], 1.0)) or (not math.isclose(a_p["cfg_scale"], 1.0))
+        # euler_ancestral_cfg_pp consumes the RAW unconditional x0 for its
+        # direction term, so the negative pass is mandatory even at cfg == 1
+        # (ComfyUI does the same via disable_cfg1_optimization=True).
+        need_uncond_for_sampler = bool(getattr(sch, "needs_uncond_pred", False))
+        need_neg = need_uncond_for_sampler or (not math.isclose(v_p["cfg_scale"], 1.0)) or (not math.isclose(a_p["cfg_scale"], 1.0))
         need_ptb = (not math.isclose(v_p["stg_scale"], 0.0)) or (not math.isclose(a_p["stg_scale"], 0.0))
         need_mod = (not math.isclose(v_p["modality_scale"], 1.0)) or (not math.isclose(a_p["modality_scale"], 1.0))
 
-        if v_skip and a_skip and sch.mm_last_v_pred is not None and sch.mm_last_a_pred is not None:
+        if not need_uncond_for_sampler and v_skip and a_skip and sch.mm_last_v_pred is not None and sch.mm_last_a_pred is not None:
             sch.v_noise_pred = sch.mm_last_v_pred
             sch.a_noise_pred = sch.mm_last_a_pred
             return
@@ -468,6 +472,9 @@ class LTX2Model(BaseTransformerModel):
         sch.mm_last_a_pred = a_out
         sch.v_noise_pred = v_out
         sch.a_noise_pred = a_out
+        # Raw (pre-guidance) uncond, for cfg_pp's direction term.
+        sch.v_noise_pred_uncond = v_noise_pred_uncond
+        sch.a_noise_pred_uncond = a_noise_pred_uncond
 
     @torch.no_grad()
     def _seq_parallel_pre_process(self, pre_infer_out):
@@ -700,6 +707,8 @@ class LTX2Model(BaseTransformerModel):
 
                 self.scheduler.v_noise_pred = v_noise_pred_uncond + self.scheduler.sample_guide_scale * (v_noise_pred_cond - v_noise_pred_uncond)
                 self.scheduler.a_noise_pred = a_noise_pred_uncond + self.scheduler.sample_guide_scale * (a_noise_pred_cond - a_noise_pred_uncond)
+                self.scheduler.v_noise_pred_uncond = v_noise_pred_uncond
+                self.scheduler.a_noise_pred_uncond = a_noise_pred_uncond
             else:
                 # ==================== CFG Processing ====================
                 v_noise_pred_cond, a_noise_pred_cond = self._infer_cond_uncond(inputs, infer_condition=True)
@@ -707,11 +716,19 @@ class LTX2Model(BaseTransformerModel):
 
                 self.scheduler.v_noise_pred = v_noise_pred_uncond + self.scheduler.sample_guide_scale * (v_noise_pred_cond - v_noise_pred_uncond)
                 self.scheduler.a_noise_pred = a_noise_pred_uncond + self.scheduler.sample_guide_scale * (a_noise_pred_cond - a_noise_pred_uncond)
+                self.scheduler.v_noise_pred_uncond = v_noise_pred_uncond
+                self.scheduler.a_noise_pred_uncond = a_noise_pred_uncond
         else:
             # ==================== No CFG ====================
             v_noise_pred, a_noise_pred = self._infer_cond_uncond(inputs, infer_condition=True)
             self.scheduler.v_noise_pred = v_noise_pred
             self.scheduler.a_noise_pred = a_noise_pred
+            if getattr(self.scheduler, "needs_uncond_pred", False):
+                # cfg_pp needs the unconditional x0 even with guidance off; this
+                # is the extra forward ComfyUI always pays for this sampler.
+                v_uncond, a_uncond = self._infer_cond_uncond(inputs, infer_condition=False)
+                self.scheduler.v_noise_pred_uncond = v_uncond
+                self.scheduler.a_noise_pred_uncond = a_uncond
 
         if self.cpu_offload:
             if self.offload_granularity == "model" and self.scheduler.step_index == self.scheduler.infer_steps - 1 and "wan2.2_moe" not in self.config["model_cls"]:

@@ -5,10 +5,47 @@ from einops import rearrange
 
 from lightx2v.models.video_encoders.hf.ltx2.upsampler.pixel_shuffle import PixelShuffleND
 from lightx2v.models.video_encoders.hf.ltx2.upsampler.res_block import ResBlock
-from lightx2v.models.video_encoders.hf.ltx2.upsampler.spatial_rational_resampler import SpatialRationalResampler
+from lightx2v.models.video_encoders.hf.ltx2.upsampler.spatial_rational_resampler import (
+    SUPPORTED_RATIONAL_SCALES,
+    SpatialRationalResampler,
+)
 from lightx2v.utils.ltx2_utils import *
 
 ModelType = TypeVar("ModelType")
+
+
+def normalize_upsampler_config(config: dict) -> dict:
+    """Return ``config`` with ``rational_spatial_scale`` folded into ``spatial_scale``.
+
+    Official LTX-2.x upsampler checkpoints spell the rational scale
+    ``rational_spatial_scale``; the model ctor takes ``spatial_scale``.
+    """
+    config = dict(config)
+    if "rational_spatial_scale" in config and "spatial_scale" not in config:
+        config["spatial_scale"] = config["rational_spatial_scale"]
+    return config
+
+
+def effective_spatial_scale_from_config(config: dict) -> float:
+    """Spatial scale the built model will actually apply, from its config dict.
+
+    ``spatial_scale`` only takes effect on the ``rational_resampler`` branch;
+    the plain PixelShuffle branch is always exactly 2x regardless of what
+    ``spatial_scale`` says. Returns 1.0 when the model does not scale space
+    (temporal-only upsamplers).
+    """
+    config = normalize_upsampler_config(config)
+    if not config.get("spatial_upsample", True):
+        return 1.0
+    if config.get("temporal_upsample", False):
+        # spatial+temporal uses PixelShuffleND(3): 2x on every axis.
+        return 2.0
+    if config.get("rational_resampler", False):
+        scale = float(config.get("spatial_scale", 2.0))
+        if scale not in SUPPORTED_RATIONAL_SCALES:
+            raise ValueError(f"Unsupported upsampler spatial_scale {scale}. Choose from {sorted(SUPPORTED_RATIONAL_SCALES)}")
+        return scale
+    return 2.0
 
 
 class ModelConfigurator(Protocol[ModelType]):
@@ -87,6 +124,17 @@ class LatentUpsampler(torch.nn.Module):
 
         self.final_conv = conv(mid_channels, in_channels, kernel_size=3, padding=1)
 
+    @property
+    def effective_spatial_scale(self) -> float:
+        """Spatial scale this instance actually applies (see module helper)."""
+        if not self.spatial_upsample:
+            return 1.0
+        if self.temporal_upsample:
+            return 2.0
+        if isinstance(self.upsampler, SpatialRationalResampler):
+            return float(self.upsampler.scale)
+        return 2.0
+
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         b, _, f, _, _ = latent.shape
 
@@ -142,6 +190,7 @@ class LatentUpsamplerConfigurator(ModelConfigurator[LatentUpsampler]):
 
     @classmethod
     def from_config(cls: type[LatentUpsampler], config: dict) -> LatentUpsampler:
+        config = normalize_upsampler_config(config)
         in_channels = config.get("in_channels", 128)
         mid_channels = config.get("mid_channels", 512)
         num_blocks_per_stage = config.get("num_blocks_per_stage", 4)

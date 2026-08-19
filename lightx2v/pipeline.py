@@ -188,8 +188,37 @@ class LightX2VPipeline:
         double_precision_rope=True,
         norm_modulate_backend="torch",
         distilled_sigma_values=None,
+        # ---- LTX-2.x two-stage / sampler knobs ----
+        # All default to None so they leave the JSON config untouched unless
+        # explicitly passed (set_args2config drops None values).
+        distilled_sigma_values_upsample=None,
+        use_upsampler=None,
+        upsampler_original_ckpt=None,
+        upsampler_spatial_scale=None,
+        sampler=None,
+        sampler_stage1=None,
+        sampler_stage2=None,
+        sampler_eta=None,
+        sampler_s_noise=None,
+        ancestral_repin_mode=None,
     ):
         self.resize_mode = resize_mode
+        # Forwarded to the runner config verbatim; see LTX2Scheduler for the
+        # sampler semantics and LTX2Runner.upsample_spatial_scale for the ratio.
+        for _key, _value in (
+            ("distilled_sigma_values_upsample", distilled_sigma_values_upsample),
+            ("use_upsampler", use_upsampler),
+            ("upsampler_original_ckpt", upsampler_original_ckpt),
+            ("upsampler_spatial_scale", upsampler_spatial_scale),
+            ("sampler", sampler),
+            ("sampler_stage1", sampler_stage1),
+            ("sampler_stage2", sampler_stage2),
+            ("sampler_eta", sampler_eta),
+            ("sampler_s_noise", sampler_s_noise),
+            ("ancestral_repin_mode", ancestral_repin_mode),
+        ):
+            if _value is not None:
+                setattr(self, _key, _value)
         if config_json is not None:
             self.set_infer_config_json(config_json)
         else:

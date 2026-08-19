@@ -6,12 +6,18 @@ from einops import rearrange
 from lightx2v.models.video_encoders.hf.ltx2.upsampler.blur_downsample import BlurDownsample
 from lightx2v.models.video_encoders.hf.ltx2.upsampler.pixel_shuffle import PixelShuffleND
 
+SUPPORTED_RATIONAL_SCALES = {0.75: (3, 4), 1.5: (3, 2), 2.0: (2, 1), 4.0: (4, 1)}
 
-def _rational_for_scale(scale: float) -> Tuple[int, int]:
-    mapping = {0.75: (3, 4), 1.5: (3, 2), 2.0: (2, 1), 4.0: (4, 1)}
-    if float(scale) not in mapping:
-        raise ValueError(f"Unsupported scale {scale}. Choose from {list(mapping.keys())}")
-    return mapping[float(scale)]
+
+def rational_for_scale(scale: float) -> Tuple[int, int]:
+    """Numerator/denominator of a supported spatial scale, e.g. 1.5 -> (3, 2)."""
+    if float(scale) not in SUPPORTED_RATIONAL_SCALES:
+        raise ValueError(f"Unsupported scale {scale}. Choose from {list(SUPPORTED_RATIONAL_SCALES.keys())}")
+    return SUPPORTED_RATIONAL_SCALES[float(scale)]
+
+
+#: Kept for the in-module call sites that predate the public name.
+_rational_for_scale = rational_for_scale
 
 
 class SpatialRationalResampler(torch.nn.Module):

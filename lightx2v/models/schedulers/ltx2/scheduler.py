@@ -16,6 +16,14 @@ import einops
 import torch
 from loguru import logger
 
+from lightx2v.models.schedulers.ltx2.samplers import (
+    STOCHASTIC_SAMPLERS,
+    UNCOND_SAMPLERS,
+    euler_ancestral_cfg_pp_step,
+    euler_ancestral_rf_step,
+    repin_conditioned_latent,
+    validate_sampler,
+)
 from lightx2v.models.schedulers.scheduler import BaseScheduler
 from lightx2v.utils.envs import *
 from lightx2v_platform.base.global_var import AI_DEVICE
@@ -297,9 +305,31 @@ class LTX2Scheduler(BaseScheduler):
     """
     Scheduler for LTX-2 diffusion model.
 
-    Handles sigma schedule generation, Euler stepping, and CFG guidance
-    for joint audio-video denoising.
+    Handles sigma schedule generation, per-stage sampler stepping, and CFG
+    guidance for joint audio-video denoising.
     """
+
+    #: Per-stage sampler defaults. Subclasses override these to keep their
+    #: released sampling behaviour when the config says nothing (see
+    #: ``LTX25Scheduler``). User config always wins over these.
+    DEFAULT_SAMPLER_STAGE1 = "euler"
+    DEFAULT_SAMPLER_STAGE2 = "euler"
+    #: How the ancestral samplers restore partially-pinned conditioning after
+    #: injecting fresh noise. ``"noised"`` re-blends toward the clean latent
+    #: noised to sigma_next (ComfyUI KSamplerX0Inpaint semantics); ``"clean"``
+    #: pins straight to the clean latent; ``"none"`` disables it.
+    DEFAULT_REPIN_MODE = "noised"
+    #: Seed offsets so the ancestral noise and the repin noise are independent
+    #: of the latent-init noise while staying reproducible.
+    ANCESTRAL_NOISE_SEED_OFFSET = 10_000
+    REPIN_NOISE_SEED_OFFSET = 20_000
+    #: Dtype the per-step ancestral noise is drawn in. float32 (the default)
+    #: matches how FastVideo's LTX-2 sampler draws it, which keeps the two
+    #: implementations comparable; drawing in the latent dtype changes both the
+    #: values and how much RNG state each step consumes, so it is not a
+    #: cosmetic choice. ``LTX25Scheduler`` sets this True to preserve its
+    #: released numerics. Override with ``ancestral_noise_in_latent_dtype``.
+    ANCESTRAL_NOISE_IN_LATENT_DTYPE = False
 
     def __init__(self, config):
         """
@@ -370,7 +400,118 @@ class LTX2Scheduler(BaseScheduler):
         # Step state
         self.v_noise_pred = None
         self.a_noise_pred = None
+        # Raw (pre-guidance) unconditional predictions; only populated when the
+        # active sampler needs them, i.e. euler_ancestral_cfg_pp.
+        self.v_noise_pred_uncond = None
+        self.a_noise_pred_uncond = None
         self.keep_latents_dtype_in_scheduler = config.get("keep_latents_dtype_in_scheduler", False)
+
+        # ---- Sampler selection (per stage) ----
+        # "sampler" sets both stages; "sampler_stage1"/"sampler_stage2" override
+        # one stage each. Matches the ComfyUI two-stage habit of, e.g.,
+        # euler_ancestral for the base pass and euler_ancestral_cfg_pp to refine.
+        shared = config.get("sampler")
+        self.sampler_stage1 = validate_sampler(
+            config.get("sampler_stage1", shared if shared is not None else self.DEFAULT_SAMPLER_STAGE1),
+            field="sampler_stage1",
+        )
+        self.sampler_stage2 = validate_sampler(
+            config.get("sampler_stage2", shared if shared is not None else self.DEFAULT_SAMPLER_STAGE2),
+            field="sampler_stage2",
+        )
+        self.sampler_eta = float(config.get("sampler_eta", 1.0))
+        self.sampler_s_noise = float(config.get("sampler_s_noise", 1.0))
+        self.repin_mode = config.get("ancestral_repin_mode", self.DEFAULT_REPIN_MODE)
+        if self.repin_mode not in ("noised", "clean", "none"):
+            raise ValueError(f"ancestral_repin_mode must be one of ['noised', 'clean', 'none'], got {self.repin_mode!r}")
+        self.ancestral_noise_in_latent_dtype = bool(config.get("ancestral_noise_in_latent_dtype", self.ANCESTRAL_NOISE_IN_LATENT_DTYPE))
+
+        self._stage = 1
+        self._ancestral_generator = None
+        self._v_cond_noise = None
+        self._a_cond_noise = None
+
+    # ------------------------------------------------------------------
+    # Stage / sampler state
+    # ------------------------------------------------------------------
+
+    @property
+    def stage(self) -> int:
+        return self._stage
+
+    def set_stage(self, stage: int) -> None:
+        if stage not in (1, 2):
+            raise ValueError(f"stage must be 1 or 2, got {stage}")
+        self._stage = stage
+
+    @property
+    def sampler(self) -> str:
+        """Sampler active for the current stage."""
+        return self.sampler_stage1 if self._stage == 1 else self.sampler_stage2
+
+    @property
+    def needs_uncond_pred(self) -> bool:
+        """Whether the active sampler needs a raw unconditional forward.
+
+        ComfyUI forces the negative pass for cfg_pp even at cfg == 1
+        (``disable_cfg1_optimization``), so the model must honour this
+        regardless of ``enable_cfg`` / guidance scale.
+        """
+        return self.sampler in UNCOND_SAMPLERS
+
+    @property
+    def is_stochastic_sampler(self) -> bool:
+        return self.sampler in STOCHASTIC_SAMPLERS
+
+    def _init_sampler_noise(self, seed: int) -> None:
+        """Seed the ancestral generator and draw the fixed repin noise.
+
+        Called from ``prepare()`` for each stage, since the latent shape (and
+        therefore the repin noise shape) changes between stage 1 and stage 2.
+        """
+        self._ancestral_generator = None
+        self._v_cond_noise = None
+        self._a_cond_noise = None
+        if not self.is_stochastic_sampler:
+            return
+
+        if self.sampler_eta > 0:
+            self._ancestral_generator = torch.Generator(device=AI_DEVICE).manual_seed(int(seed) + self.ANCESTRAL_NOISE_SEED_OFFSET)
+
+        if self.repin_mode == "noised":
+            gen = torch.Generator(device=AI_DEVICE).manual_seed(int(seed) + self.REPIN_NOISE_SEED_OFFSET)
+            for attr, state in (("_v_cond_noise", self.video_latent_state), ("_a_cond_noise", self.audio_latent_state)):
+                if state is None:
+                    continue
+                setattr(
+                    self,
+                    attr,
+                    torch.randn(state.latent.shape, dtype=torch.float32, device=state.latent.device, generator=gen),
+                )
+
+    @staticmethod
+    def check_sampler_schedule(sampler: str, first_sigma: float, *, stage: int) -> None:
+        """Reject sampler/schedule combinations that cannot work, with context.
+
+        ``euler_ancestral_cfg_pp`` divides by ``alpha = 1 - sigma``, so a
+        schedule starting at sigma == 1.0 makes its very first step singular
+        (ComfyUI silently emits inf/NaN there). Every auto-generated LTX-2
+        schedule and the distilled stage-1 list start at exactly 1.0, so cfg_pp
+        is a stage-2 / refine sampler unless the schedule is changed.
+        """
+        if sampler in UNCOND_SAMPLERS and float(first_sigma) >= 1.0:
+            raise ValueError(
+                f"sampler_stage{stage}={sampler!r} cannot run on a schedule whose first sigma is "
+                f"{float(first_sigma)} -- alpha = 1 - sigma is 0 there and the step is undefined. "
+                f"Either use it only on the stage whose schedule starts below 1.0 (typically stage 2 / "
+                f"the upsample refine pass), or set the stage-{stage} sigmas to start at e.g. 0.99."
+            )
+
+    def _draw_ancestral_noise(self, like: torch.Tensor, latent_dtype: torch.dtype) -> Optional[torch.Tensor]:
+        if self._ancestral_generator is None:
+            return None
+        dtype = latent_dtype if self.ancestral_noise_in_latent_dtype else torch.float32
+        return torch.randn(like.shape, dtype=dtype, device=like.device, generator=self._ancestral_generator)
 
     def step_pre(self, step_index):
         self.step_index = step_index
@@ -442,10 +583,17 @@ class LTX2Scheduler(BaseScheduler):
             reference_video_latent=reference_video_latent,
         )
 
+        # Sampler noise depends on the latent shapes just created, so this has
+        # to run after prepare_latents (and again for stage 2, which re-prepares
+        # at the upsampled resolution).
+        self._init_sampler_noise(seed)
+
         # Match the official one-stage pipeline, which builds the schedule
         # without a latent and therefore uses the 4096-token shift anchor.
         if self.sigmas is None:
             self.set_timesteps(infer_steps=self.infer_steps)
+
+        self.check_sampler_schedule(self.sampler, float(self.sigmas[0]), stage=self._stage)
 
     def prepare_latents(
         self,
@@ -907,11 +1055,30 @@ class LTX2Scheduler(BaseScheduler):
         )
 
     def step_post(self):
-        self.v_noise_pred = self.post_process_latent(self.v_noise_pred, self.video_latent_state.denoise_mask, self.video_latent_state.clean_latent)
-        self.a_noise_pred = self.post_process_latent(self.a_noise_pred, self.audio_latent_state.denoise_mask, self.audio_latent_state.clean_latent)
-
         sigma = self.sigmas[self.step_index]
         sigma_next = self.sigmas[self.step_index + 1]
+
+        if self.sampler == "euler":
+            # NOTE: no float() pre-cast here -- post_process_latent returns the
+            # prediction's own dtype, and to_velocity rounds through it again.
+            # That rounding sequence is load-bearing for euler reproducibility.
+            self.v_noise_pred = self.post_process_latent(self.v_noise_pred, self.video_latent_state.denoise_mask, self.video_latent_state.clean_latent)
+            self.a_noise_pred = self.post_process_latent(self.a_noise_pred, self.audio_latent_state.denoise_mask, self.audio_latent_state.clean_latent)
+            self._step_euler(sigma, sigma_next)
+        else:
+            self._step_ancestral(sigma, sigma_next)
+
+        # Unpatchify latents on the final step (aligned with source code)
+        if self.step_index == self.infer_steps - 1:
+            self._unpatchify_final_latents()
+
+    def _step_euler(self, sigma: torch.Tensor, sigma_next: torch.Tensor) -> None:
+        """Deterministic rectified-flow Euler update (LTX-2 default).
+
+        Kept verbatim -- including the ``to_velocity`` round-trip through the
+        latent dtype -- so enabling configurable samplers does not perturb
+        existing euler results.
+        """
         dt = sigma_next - sigma
 
         v_velocity = self.to_velocity(self.video_latent_state.latent, sigma, self.v_noise_pred)
@@ -922,9 +1089,70 @@ class LTX2Scheduler(BaseScheduler):
         self.video_latent_state.latent = v_latent.to(self.video_latent_state.latent.dtype)
         self.audio_latent_state.latent = a_latent.to(self.audio_latent_state.latent.dtype)
 
-        # Unpatchify latents on the final step (aligned with source code)
-        if self.step_index == self.infer_steps - 1:
-            self._unpatchify_final_latents()
+    def _step_ancestral(self, sigma: torch.Tensor, sigma_next: torch.Tensor) -> None:
+        """Ancestral (stochastic) update: euler_ancestral / euler_ancestral_cfg_pp.
+
+        Draws video noise before audio noise from one generator, so the two
+        modalities share a single reproducible noise stream.
+        """
+        sampler = self.sampler
+        if sampler in UNCOND_SAMPLERS and self.v_noise_pred_uncond is None:
+            raise RuntimeError(
+                f"sampler {sampler!r} needs the unconditional prediction, but v_noise_pred_uncond is None. This means the model skipped the negative forward -- check needs_uncond_pred plumbing."
+            )
+
+        # Restore conditioning in float32 (the released LTX-2.5 ancestral loop
+        # pre-cast the prediction with .float() before pinning, so the pinned
+        # value never round-trips through bfloat16).
+        self.v_noise_pred = self.post_process_latent(self.v_noise_pred.float(), self.video_latent_state.denoise_mask, self.video_latent_state.clean_latent)
+        self.a_noise_pred = self.post_process_latent(self.a_noise_pred.float(), self.audio_latent_state.denoise_mask, self.audio_latent_state.clean_latent)
+
+        # cfg_pp reads the raw unconditional x0, so it needs the same
+        # conditioning restoration the guided prediction just got.
+        if sampler in UNCOND_SAMPLERS:
+            v_uncond = self.post_process_latent(self.v_noise_pred_uncond.float(), self.video_latent_state.denoise_mask, self.video_latent_state.clean_latent)
+            a_uncond = self.post_process_latent(self.a_noise_pred_uncond.float(), self.audio_latent_state.denoise_mask, self.audio_latent_state.clean_latent)
+        else:
+            v_uncond = a_uncond = None
+
+        for state, pred, uncond, cond_noise in (
+            (self.video_latent_state, self.v_noise_pred, v_uncond, self._v_cond_noise),
+            (self.audio_latent_state, self.a_noise_pred, a_uncond, self._a_cond_noise),
+        ):
+            latent_dtype = state.latent.dtype
+            x = state.latent.to(torch.float32)
+            denoised = pred.to(torch.float32)
+            noise = self._draw_ancestral_noise(x, latent_dtype)
+
+            if sampler == "euler_ancestral":
+                nxt = euler_ancestral_rf_step(x, denoised, sigma, sigma_next, noise, eta=self.sampler_eta, s_noise=self.sampler_s_noise)
+            else:
+                nxt = euler_ancestral_cfg_pp_step(
+                    x,
+                    denoised,
+                    uncond.to(torch.float32),
+                    sigma,
+                    sigma_next,
+                    noise,
+                    eta=self.sampler_eta,
+                    s_noise=self.sampler_s_noise,
+                )
+
+            # Fresh noise was sprayed over the whole latent; restore the
+            # partially-pinned conditioning regions before the next forward.
+            if float(sigma_next) > 0.0 and self.repin_mode != "none":
+                if self.repin_mode == "noised" and cond_noise is not None:
+                    nxt = repin_conditioned_latent(
+                        nxt,
+                        clean_latent=state.clean_latent,
+                        denoise_mask=state.denoise_mask,
+                        cond_noise=cond_noise,
+                        sigma_next=sigma_next,
+                    )
+                elif self.repin_mode == "clean":
+                    nxt = self.post_process_latent(nxt, state.denoise_mask, state.clean_latent)
+
+            state.latent = nxt.to(latent_dtype)
 
     def clear(self):
         """Clear scheduler state."""
@@ -934,10 +1162,15 @@ class LTX2Scheduler(BaseScheduler):
         self.audio_latent_state = None
         self.v_noise_pred = None
         self.a_noise_pred = None
+        self.v_noise_pred_uncond = None
+        self.a_noise_pred_uncond = None
         self.mm_last_v_pred = None
         self.mm_last_a_pred = None
         self.sigmas = None
         self._video_main_num_tokens = None
+        self._ancestral_generator = None
+        self._v_cond_noise = None
+        self._a_cond_noise = None
 
     def video_timesteps_from_mask(self) -> torch.Tensor:
         """Compute timesteps from a denoise mask and sigma value.
