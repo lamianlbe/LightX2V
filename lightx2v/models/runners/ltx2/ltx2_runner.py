@@ -108,6 +108,7 @@ class LTX2Runner(DefaultRunner):
         super().__init__(config)
         self._upsample_scale_cache = None
         self._vae_scale_factors_cache = None
+        self._audio_cfg_warned = set()
 
     # ------------------------------------------------------------------
     # Two-stage geometry
@@ -173,6 +174,38 @@ class LTX2Runner(DefaultRunner):
                 )
             self._vae_scale_factors_cache = tuple(int(x) for x in factors)
         return self._vae_scale_factors_cache
+
+    # Audio geometry. Normally arrives via <model_path>/config.json; the
+    # scheduler already defaults these (see LTX2Scheduler's AudioPatchifier
+    # setup and audio_vae.LATENT_DOWNSAMPLE_FACTOR), so match it rather than
+    # hard-subscripting and dying halfway through the pipeline. Each logs once
+    # when it falls back, because a wrong value mis-sizes the audio latent.
+    _AUDIO_DEFAULTS = {"audio_sampling_rate": 16000, "audio_hop_length": 160, "audio_scale_factor": 4, "audio_mel_bins": 16}
+
+    def _audio_cfg(self, key: str):
+        value = self.config.get(key)
+        if value is None:
+            value = self._AUDIO_DEFAULTS[key]
+            if key not in self._audio_cfg_warned:
+                self._audio_cfg_warned.add(key)
+                logger.warning(f"config has no {key}; assuming {value}. Set it explicitly if this model differs -- tools/convert/ltx2_diffusers_to_lightx2v.py derives it from the audio VAE config.")
+        return value
+
+    @property
+    def audio_sampling_rate(self):
+        return self._audio_cfg("audio_sampling_rate")
+
+    @property
+    def audio_hop_length(self):
+        return self._audio_cfg("audio_hop_length")
+
+    @property
+    def audio_scale_factor(self):
+        return self._audio_cfg("audio_scale_factor")
+
+    @property
+    def audio_mel_bins(self):
+        return self._audio_cfg("audio_mel_bins")
 
     @property
     def stage1_size_alignment(self) -> int:
@@ -509,13 +542,13 @@ class LTX2Runner(DefaultRunner):
         )
 
         duration = float(target_video_length) / float(self.config["fps"])
-        latents_per_second = float(self.config["audio_sampling_rate"]) / float(self.config["audio_hop_length"]) / float(self.config["audio_scale_factor"])
+        latents_per_second = float(self.audio_sampling_rate) / float(self.audio_hop_length) / float(self.audio_scale_factor)
         audio_frames = round(duration * latents_per_second)
 
         audio_latent_shape = (
             8,
             audio_frames,
-            self.config["audio_mel_bins"],
+            self.audio_mel_bins,
         )
 
         return video_latent_shape, audio_latent_shape

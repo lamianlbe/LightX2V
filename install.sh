@@ -303,6 +303,17 @@ install_core() {
     #               only arrives transitively via torchvision
     #   librosa     audio feature extraction on the Wan audio paths
     run_sh "${PIP} install soundfile torchcodec Pillow librosa"
+
+    # transformers is pinned because its version decides whether a stock
+    # google/gemma-3-12b-it checkpoint loads at all. 5.5.4 maps the shipped
+    # language_model.model.* / vision_tower.vision_model.* keys correctly;
+    # 5.15.1 does not and randomly initialises the whole text encoder WITHOUT
+    # erroring, so generation quietly ignores the prompt. Going older is not an
+    # option either -- LightX2V's Gemma code imports transformers.masking_utils,
+    # which arrived in the same refactor. Use tools/convert/ltx2_remap_gemma.py
+    # if you need a newer transformers than this.
+    run_sh "${PIP} install 'transformers==${TRANSFORMERS_VERSION:-5.5.4}'"
+    ok "transformers ${TRANSFORMERS_VERSION:-5.5.4} (Gemma key-layout compatible)"
     ok "core (pyproject + requirements.txt + undeclared runtime imports)"
 }
 

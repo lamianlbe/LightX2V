@@ -276,6 +276,51 @@ def derive_vae_scale_factors(vae_cfg: dict) -> List[int]:
     return [temporal, spatial, spatial]
 
 
+def derive_audio_geometry(audio_cfg: dict) -> Dict[str, object]:
+    """Audio latent geometry the LTX-2 runner needs, from the audio VAE's config.
+
+    The runner sizes the audio latent as
+    ``sampling_rate / hop_length / scale_factor`` frames by ``mel_bins`` bins,
+    and reads each of those from the top-level config -- which a diffusers
+    export keeps nested inside audio_vae/config.json instead.
+
+    ``audio_scale_factor`` is the audio VAE's latent downsample, which LightX2V
+    fixes at ``audio_vae.LATENT_DOWNSAMPLE_FACTOR = 4``; it also equals
+    ``2 ** (len(ch_mult) - 1)`` for a stock config, so a disagreement means the
+    VAE is not stock and is worth surfacing rather than silently trusting.
+
+    ``audio_mel_bins`` is the LATENT bin count -- the mel channels after that
+    downsample (64 / 4 = 16), not the 64 the VAE config lists.
+    """
+    pre = audio_cfg.get("preprocessing", {})
+    params = audio_cfg.get("model", {}).get("params", {})
+    ddconfig = params.get("ddconfig", {})
+
+    sampling_rate = pre.get("audio", {}).get("sampling_rate") or params.get("sampling_rate") or 16000
+    hop_length = pre.get("stft", {}).get("hop_length") or 160
+    mel_channels = pre.get("mel", {}).get("n_mel_channels") or ddconfig.get("mel_bins") or 64
+
+    scale_factor = 4  # LightX2V's audio_vae.LATENT_DOWNSAMPLE_FACTOR
+    ch_mult = ddconfig.get("ch_mult")
+    if ch_mult:
+        implied = 2 ** (len(ch_mult) - 1)
+        if implied != scale_factor:
+            print(
+                f"  note: audio VAE ch_mult={ch_mult} implies a {implied}x latent downsample, but LightX2V's audio decoder is fixed at {scale_factor}x. Emitting {scale_factor}; check the audio latent shape if output length looks wrong."
+            )
+
+    mel_bins, rem = divmod(int(mel_channels), scale_factor)
+    if rem:
+        print(f"  note: {mel_channels} mel channels is not divisible by the {scale_factor}x downsample; audio_mel_bins rounded down to {mel_bins}")
+
+    return {
+        "audio_sampling_rate": int(sampling_rate),
+        "audio_hop_length": int(hop_length),
+        "audio_scale_factor": int(scale_factor),
+        "audio_mel_bins": int(mel_bins),
+    }
+
+
 def load_json(path: Path) -> dict:
     with open(path) as f:
         return json.load(f)
@@ -417,8 +462,15 @@ def verify(out: Path, name: str) -> int:
         arch = load_json(cfg_json)
         print(f"  config.json: num_layers={arch.get('num_layers')} in_channels={arch.get('in_channels')} vae_scale_factors={arch.get('vae_scale_factors')}")
         if not arch.get("vae_scale_factors"):
-            print("  FAIL config.json has no vae_scale_factors -- the runner indexes it directly and will KeyError")
+            print("  FAIL config.json has no vae_scale_factors -- the runner sizes every video latent from it")
             problems += 1
+        audio_keys = ["audio_sampling_rate", "audio_hop_length", "audio_scale_factor", "audio_mel_bins"]
+        missing_audio = [k for k in audio_keys if arch.get(k) is None]
+        if missing_audio:
+            print(f"  FAIL config.json missing audio geometry: {missing_audio} -- the runner sizes the audio latent from these")
+            problems += 1
+        else:
+            print(f"  audio geometry: {{{', '.join(f'{k}={arch[k]}' for k in audio_keys)}}}")
 
     gemma = out / "gemma"
     for probe in ("tokenizer.model", "preprocessor_config.json"):
@@ -496,9 +548,14 @@ def main() -> int:
     scale_factors = derive_vae_scale_factors(vae_cfg)
     arch["vae_scale_factors"] = scale_factors
     arch.setdefault("vae_stride", scale_factors)
+
+    audio_cfg = load_json(args.src / "audio_vae" / "config.json")
+    audio_geom = derive_audio_geometry(audio_cfg.get("audio_vae", audio_cfg))
+    arch.update(audio_geom)
     with open(args.out / "config.json", "w") as f:
         json.dump(arch, f, indent=2)
     print(f"\nWrote {args.out / 'config.json'} (DiT architecture, num_layers={arch.get('num_layers')}, vae_scale_factors={scale_factors})")
+    print(f"  audio geometry: {audio_geom}")
     if scale_factors != [8, 32, 32]:
         print(f"  note: derived {scale_factors} rather than the stock LTX-2 [8, 32, 32] -- double-check the VAE's encoder_blocks if that is unexpected")
 
