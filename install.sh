@@ -10,7 +10,11 @@
 #   ./install.sh --arch 10.0          # override the detected compute capability
 #   ./install.sh --verify             # only report what is already installed
 #
-# Scope: server GPUs only -- H100/H200 (sm90), B200 (sm100), B300 (sm103).
+# Scope: server GPUs only -- H100/H200 (sm90), B200 (sm100), B300 (sm103),
+# all on CUDA 13.0. torch is installed from the cu130 index for every one of
+# them (upstream's reference image is dockerfiles/Dockerfile_cu130: torch 2.11
+# + CUDA 13.0, whose SageAttention build already covers sm90). Needs an r580+
+# driver; override the index with UV_TORCH_BACKEND if you must stay on cu12.
 # Consumer Blackwell (5090, RTX Pro 6000 / sm120) is deliberately out of scope
 # on this branch, which also means the nvfp4 / mxfp* path is out of scope:
 # lightx2v_kernel compiles for sm120a only.
@@ -142,10 +146,34 @@ detect_env() {
         GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
     fi
 
+    DRIVER_VER=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        DRIVER_VER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')"
+    fi
+
+    # The CUDA runtime we will actually be running on. This is what decides
+    # wheel flavours (e.g. FA4's cu13 extra) -- NOT nvcc, which only affects
+    # source builds. An already-installed torch wins, since we leave it alone;
+    # otherwise it is whatever index install_core will pull from.
+    TORCH_BACKEND="${UV_TORCH_BACKEND:-cu130}"
+    if [[ -n "${TORCH_CUDA}" ]]; then
+        CUDA_TARGET="${TORCH_CUDA}"
+    else
+        case "${TORCH_BACKEND}" in
+            cu130) CUDA_TARGET="13.0" ;;
+            cu129) CUDA_TARGET="12.9" ;;
+            cu128) CUDA_TARGET="12.8" ;;
+            cu126) CUDA_TARGET="12.6" ;;
+            *)     CUDA_TARGET="" ;;
+        esac
+    fi
+    echo "    cuda target      : ${CUDA_TARGET:-<unknown>}  (torch index ${TORCH_BACKEND})"
+
     log "environment"
     echo "    python           : ${PY_VER}"
     echo "    torch            : ${TORCH_VER:-<not installed>}  (cuda ${TORCH_CUDA:-n/a})"
     echo "    nvcc             : ${NVCC_CUDA:-<not found>}"
+    echo "    driver           : ${DRIVER_VER:-<unknown>}"
     echo "    gpu              : ${GPU_NAME:-<none detected>}  (compute cap ${ARCH:-unknown})"
     echo "    build dir        : ${BUILD_DIR}"
     echo "    parallel jobs    : ${JOBS}"
@@ -166,16 +194,23 @@ detect_env() {
     esac
     echo "    gpu class        : ${GPU_CLASS}"
 
-    # nvcc version only matters for the operators built from source below
-    # (SageAttention 3, SpargeAttn, MagiAttention). The torch wheel carries its
-    # own CUDA runtime and is chosen separately.
-    if [[ "${GPU_CLASS}" == "blackwell-server" ]]; then
-        case "${NVCC_CUDA}" in
-            13.*) : ;;
-            "")   warn "no nvcc on PATH. Source-built operators (sage3) need a CUDA 13.0 toolkit on B200/B300; install one or use the prebuilt image: lightx2v/lightx2v:<date>-cu130" ;;
-            *)    warn "nvcc reports CUDA ${NVCC_CUDA}, but B200/B300 want CUDA 13.0 -- that is what upstream builds and tests (dockerfiles/Dockerfile_cu130: torch 2.11 + cuda 13.0, and the docs recommend cuda130 for speed). Source-built operators will compile against ${NVCC_CUDA} and may not emit sm100/sm103 code. Prebuilt alternative: lightx2v/lightx2v:<date>-cu130" ;;
-        esac
+    # The driver is the real constraint on the torch wheel: a cu130 wheel
+    # carries its own CUDA 13 runtime but still needs an r580+ driver.
+    if [[ -n "${DRIVER_VER}" ]]; then
+        local drv_major="${DRIVER_VER%%.*}"
+        if [[ "${drv_major}" =~ ^[0-9]+$ ]] && (( drv_major < 580 )); then
+            warn "driver ${DRIVER_VER} is older than r580 and cannot run CUDA 13 wheels. Either update the driver, or pin an older stack with UV_TORCH_BACKEND=cu128 (note that upstream's cu128 image is still on torch 2.8)."
+        fi
     fi
+
+    # nvcc governs the operators built from source (SageAttention 2/3,
+    # SpargeAttn, MagiAttention) -- not the torch wheel, which is chosen
+    # independently in install_core.
+    case "${NVCC_CUDA}" in
+        13.*) : ;;
+        "")   warn "no nvcc on PATH. The source-built operators need a CUDA 13.0 toolkit; install one, or skip them with --minimal, or use the prebuilt image: lightx2v/lightx2v:<date>-cu130" ;;
+        *)    warn "nvcc reports CUDA ${NVCC_CUDA}, but this branch targets CUDA 13.0 for every supported GPU -- that is what upstream builds and tests (dockerfiles/Dockerfile_cu130: torch 2.11 + cuda 13.0, SageAttention arch list includes 9.0). torch will still be installed from the cu130 index; only the source-built operators would compile against ${NVCC_CUDA}. Prebuilt alternative: lightx2v/lightx2v:<date>-cu130" ;;
+    esac
 }
 
 # Which attention backends make sense for this compute capability.
@@ -215,24 +250,17 @@ install_core() {
     log "core Python dependencies"
 
     if [[ -z "${TORCH_VER}" ]]; then
-        local backend="${UV_TORCH_BACKEND:-}"
-        if [[ -z "${backend}" ]]; then
-            # Blackwell server parts are a cu13 target: upstream's reference
-            # image is Dockerfile_cu130 (torch 2.11 + CUDA 13.0) and the docs
-            # recommend cuda130 for speed. A pip torch wheel bundles its own
-            # CUDA runtime, so this index does NOT have to match the local
-            # nvcc -- only the driver has to be new enough. nvcc still matters
-            # for the source-built operators below, which is a separate check.
-            if [[ "${GPU_CLASS}" == "blackwell-server" ]]; then
-                backend="cu130"
-            else
-                case "${NVCC_CUDA}" in
-                    13.*)      backend="cu130" ;;
-                    12.8|12.9) backend="cu128" ;;
-                    12.*)      backend="cu126" ;;
-                esac
-            fi
-        fi
+        # cu130 for every GPU this branch supports, Hopper included. Upstream's
+        # reference image (dockerfiles/Dockerfile_cu130, torch 2.11 + CUDA 13.0)
+        # builds SageAttention with 9.0 in its arch list and MagiAttention for
+        # "90,100" -- so H100/H200 are a first-class cu13 target, not a
+        # leftover cu12 one, and the docs recommend cuda130 for speed.
+        #
+        # Deliberately NOT derived from the local nvcc: a pip torch wheel ships
+        # its own CUDA runtime, so the index only has to suit the driver. nvcc
+        # governs the source-built operators, which is checked separately in
+        # detect_env.
+        local backend="${TORCH_BACKEND}"
         if [[ -n "${backend}" ]]; then
             log "installing torch for ${backend} (override with UV_TORCH_BACKEND)"
             run_sh "${PIP} install 'torch<=2.11.0' 'torchvision<=0.26.0' 'torchaudio<=2.11.0' --index-url https://download.pytorch.org/whl/${backend}"
@@ -276,11 +304,13 @@ install_fa4() {
     # Published wheel, not a source build -- this is the fast one (seconds, not
     # the 20-60 min a FlashAttention 2 source build costs). The kernels are
     # CuTe-DSL and JIT at first use.
-    if [[ "${NVCC_CUDA}" == 13.* ]]; then
-        log "FlashAttention 4 (CuTe DSL, cu13 extra)"
+    # The cu13 extra tracks the CUDA runtime the CuTe kernels JIT against,
+    # which comes from torch -- not from the local nvcc.
+    if [[ "${CUDA_TARGET}" == 13.* ]]; then
+        log "FlashAttention 4 (CuTe DSL, cu13 extra for CUDA ${CUDA_TARGET})"
         run_sh "${PIP} install 'flash-attn-4[cu13]'"
     else
-        log "FlashAttention 4 (CuTe DSL)"
+        log "FlashAttention 4 (CuTe DSL, CUDA ${CUDA_TARGET:-unknown})"
         run_sh "${PIP} install flash-attn-4"
     fi
     ok "flash_attn4 (attn_type=flash_attn4 / spas_flash_attn4)"
