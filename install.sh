@@ -5,7 +5,7 @@
 #   ./install.sh                      # core deps + the operators that fit this GPU
 #   ./install.sh --minimal            # pure-Python only, no compilation (torch_sdpa attention)
 #   ./install.sh --dry-run            # print every command without running it
-#   ./install.sh --attn fa2,sage2     # pick attention backends explicitly
+#   ./install.sh --attn fa4,sage2     # pick attention backends explicitly
 #   ./install.sh --quant sgl,vllm     # pick quantization backends explicitly
 #   ./install.sh --arch 10.0          # override the detected compute capability
 #   ./install.sh --verify             # only report what is already installed
@@ -122,7 +122,10 @@ detect_env() {
 
     NVCC_CUDA=""
     if command -v nvcc >/dev/null 2>&1; then
-        NVCC_CUDA="$(nvcc --version | sed -n 's/.*release \([0-9]\+\.[0-9]\+\).*/\1/p')"
+        # NB: [0-9][0-9]* rather than [0-9]\+ -- BSD sed rejects \+ in a BRE
+        # and would silently yield an empty version, which would then skip the
+        # cu13 wheel selection below.
+        NVCC_CUDA="$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
     fi
 
     ARCH=""
@@ -168,15 +171,16 @@ detect_env() {
 #     unavailable on B200/B300.
 #   * SageAttention 3 (sageattn3_blackwell) is the Blackwell FP4 attention:
 #     B200/B300 only, not Hopper.
-#   * FlashAttention 3 covers Hopper and Blackwell.
-#   * FlashAttention 4 (CuTe DSL) is the portable high-performance choice on
-#     Blackwell and the one to reach for first on B200/B300.
+#   * FlashAttention 4 (CuTe DSL) covers Hopper AND Blackwell, ships as a
+#     published wheel, and JITs its kernels -- so it is the default everywhere
+#     here and FlashAttention 2/3 are not installed at all. FA2 in particular
+#     cost a 20-60 min source build for a strictly older kernel.
 #   * SpargeAttn tops out at 9.0, so it is Hopper-only here.
 default_attn_for_arch() {
     case "${1:-}" in
-        9.0)        echo "fa2,fa3,sage2" ;;              # H100/H200
-        10.0|10.3)  echo "fa2,fa3,fa4,sage3" ;;          # B200/B300: no sage2
-        *)          echo "fa2,fa3,sage2" ;;              # unknown: Hopper-ish default
+        9.0)        echo "fa4,sage2" ;;                  # H100/H200
+        10.0|10.3)  echo "fa4,sage3" ;;                  # B200/B300: no sage2
+        *)          echo "fa4" ;;                        # unknown: the portable one
     esac
 }
 
@@ -233,43 +237,24 @@ install_core() {
 # attention operators
 # ----------------------------------------------------------------------------
 
-install_fa2() {
-    if [[ "${NVCC_CUDA}" == 13.* ]]; then
-        # cu13 has no official FA2 wheel; upstream uses this prebuilt one.
-        log "FlashAttention 2 (prebuilt cu130 wheel)"
-        run_sh "${PIP} install --no-cache-dir 'https://github.com/alkemiik-coder/FlashAttention-2.8.3-Custom-Linux-Wheels/releases/download/FA.2.8.3-custom-linux-wheels-x86_64/flash_attn-2.8.3+cu130torch2.11cxx11abiTRUEfullsm80sm90sm100sm120nvcc130-cp312-cp312-linux_x86_64.whl'"
-    else
-        log "FlashAttention 2 (pip; compiles from source, typically 20-60 min)"
-        run_sh "${PIP} install flash-attn --no-build-isolation"
-    fi
-    ok "flash_attn2"
-}
-
-install_fa3() {
-    if [[ "${NVCC_CUDA}" == 13.* ]]; then
-        log "FlashAttention 3 (prebuilt cu130 wheel)"
-        run_sh "${PIP} install --no-cache-dir 'https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.05.11-5e0e3b1/flash_attn_3-3.0.0%2B20260511.cu130torch2110cxx11abitrue.ab6632-cp39-abi3-linux_x86_64.whl'"
-    else
-        log "FlashAttention 3 (source, hopper/)"
-        fetch "https://github.com/Dao-AILab/flash-attention.git" "flash-attention" "--recursive"
-        run_sh "cd '${BUILD_DIR}/flash-attention/hopper' && MAX_JOBS=${JOBS} python setup.py install"
-    fi
-    ok "flash_attn3"
-}
-
 install_fa4() {
-    log "FlashAttention 4 (CuTe DSL)"
-    fetch "https://github.com/Dao-AILab/flash-attention.git" "flash-attention" "--recursive"
-    local extra="dev"
-    [[ "${NVCC_CUDA}" == 13.* ]] && extra="dev,cu13"
-    run_sh "cd '${BUILD_DIR}/flash-attention' && ${PIP} install -e 'flash_attn/cute[${extra}]'"
+    # Published wheel, not a source build -- this is the fast one (seconds, not
+    # the 20-60 min a FlashAttention 2 source build costs). The kernels are
+    # CuTe-DSL and JIT at first use.
+    if [[ "${NVCC_CUDA}" == 13.* ]]; then
+        log "FlashAttention 4 (CuTe DSL, cu13 extra)"
+        run_sh "${PIP} install 'flash-attn-4[cu13]'"
+    else
+        log "FlashAttention 4 (CuTe DSL)"
+        run_sh "${PIP} install flash-attn-4"
+    fi
     ok "flash_attn4 (attn_type=flash_attn4 / spas_flash_attn4)"
 }
 
 install_sage2() {
     case "${ARCH}" in
         10.0|10.3)
-            skip "sage_attn2: SageAttention 2 has no sm100/sm103 kernels; use fa4 (recommended) or fa3/sage3 on B200/B300"
+            skip "sage_attn2: SageAttention 2 has no sm100/sm103 kernels; use fa4 (default) or sage3 on B200/B300"
             return 0 ;;
     esac
     log "SageAttention 2 (source)"
@@ -317,18 +302,17 @@ install_magi() {
 install_attn() {
     local spec="$1"
     log "attention operators: ${spec}"
-    local IFS=','
-    for backend in ${spec}; do
+    local backends=()
+    IFS=',' read -r -a backends <<< "${spec}"
+    for backend in "${backends[@]}"; do
         case "${backend}" in
-            fa2)    install_fa2 ;;
-            fa3)    install_fa3 ;;
             fa4)    install_fa4 ;;
             sage2)  install_sage2 ;;
             sage3)  install_sage3 ;;
             sparge) install_sparge ;;
             magi)   install_magi ;;
             none)   skip "attention operators (explicitly disabled)" ;;
-            *)      die "unknown attention backend '${backend}' (fa2|fa3|fa4|sage2|sage3|sparge|magi|none)" ;;
+            *)      die "unknown attention backend '${backend}' (fa4|sage2|sage3|sparge|magi|none)" ;;
         esac
     done
 }
@@ -340,8 +324,9 @@ install_attn() {
 install_quant() {
     local spec="$1"
     log "quantization operators: ${spec}"
-    local IFS=','
-    for backend in ${spec}; do
+    local backends=()
+    IFS=',' read -r -a backends <<< "${spec}"
+    for backend in "${backends[@]}"; do
         case "${backend}" in
             sgl)
                 # Also gives LightX2V its default fused RMSNorm (rms_norm_type
@@ -379,9 +364,9 @@ import importlib, sys
 CORE = [("torch", None), ("safetensors", None), ("transformers", None), ("diffusers", None),
         ("einops", None), ("loguru", None), ("av", "video/audio muxing for LTX-2"),
         ("PIL", "image conditioning"), ("numpy", None)]
-ATTN = [("flash_attn", "attn_type=flash_attn2"),
-        ("flash_attn_interface", "attn_type=flash_attn3"),
-        ("flash_attn.cute", "attn_type=flash_attn4 / spas_flash_attn4"),
+ATTN = [("flash_attn.cute", "attn_type=flash_attn4 / spas_flash_attn4"),
+        ("flash_attn", "attn_type=flash_attn2 (not installed by this script)"),
+        ("flash_attn_interface", "attn_type=flash_attn3 (not installed by this script)"),
         ("sageattention", "attn_type=sage_attn2"),
         ("sageattn3", "attn_type=sage_attn3"),
         ("spas_sage_attn", "attn_type=spas_sage_attn2"),
