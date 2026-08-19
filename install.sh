@@ -165,6 +165,17 @@ detect_env() {
         *)          die "compute cap ${ARCH} is not a supported server GPU on this branch (expected 9.0 for H100/H200, 10.0 for B200, 10.3 for B300)." ;;
     esac
     echo "    gpu class        : ${GPU_CLASS}"
+
+    # nvcc version only matters for the operators built from source below
+    # (SageAttention 3, SpargeAttn, MagiAttention). The torch wheel carries its
+    # own CUDA runtime and is chosen separately.
+    if [[ "${GPU_CLASS}" == "blackwell-server" ]]; then
+        case "${NVCC_CUDA}" in
+            13.*) : ;;
+            "")   warn "no nvcc on PATH. Source-built operators (sage3) need a CUDA 13.0 toolkit on B200/B300; install one or use the prebuilt image: lightx2v/lightx2v:<date>-cu130" ;;
+            *)    warn "nvcc reports CUDA ${NVCC_CUDA}, but B200/B300 want CUDA 13.0 -- that is what upstream builds and tests (dockerfiles/Dockerfile_cu130: torch 2.11 + cuda 13.0, and the docs recommend cuda130 for speed). Source-built operators will compile against ${NVCC_CUDA} and may not emit sm100/sm103 code. Prebuilt alternative: lightx2v/lightx2v:<date>-cu130" ;;
+        esac
+    fi
 }
 
 # Which attention backends make sense for this compute capability.
@@ -205,12 +216,22 @@ install_core() {
 
     if [[ -z "${TORCH_VER}" ]]; then
         local backend="${UV_TORCH_BACKEND:-}"
-        if [[ -z "${backend}" && -n "${NVCC_CUDA}" ]]; then
-            case "${NVCC_CUDA}" in
-                13.*) backend="cu130" ;;
-                12.8|12.9) backend="cu128" ;;
-                12.*) backend="cu126" ;;
-            esac
+        if [[ -z "${backend}" ]]; then
+            # Blackwell server parts are a cu13 target: upstream's reference
+            # image is Dockerfile_cu130 (torch 2.11 + CUDA 13.0) and the docs
+            # recommend cuda130 for speed. A pip torch wheel bundles its own
+            # CUDA runtime, so this index does NOT have to match the local
+            # nvcc -- only the driver has to be new enough. nvcc still matters
+            # for the source-built operators below, which is a separate check.
+            if [[ "${GPU_CLASS}" == "blackwell-server" ]]; then
+                backend="cu130"
+            else
+                case "${NVCC_CUDA}" in
+                    13.*)      backend="cu130" ;;
+                    12.8|12.9) backend="cu128" ;;
+                    12.*)      backend="cu126" ;;
+                esac
+            fi
         fi
         if [[ -n "${backend}" ]]; then
             log "installing torch for ${backend} (override with UV_TORCH_BACKEND)"
@@ -230,11 +251,21 @@ install_core() {
     fi
 
     # `pip install -e .` covers pyproject's dependency list, but requirements.txt
-    # carries several that pyproject omits (sgl-kernel, torchao, langdetect, zmq,
-    # jsonschema, pymongo, modelscope). Install both so neither set is missing.
+    # carries several that pyproject omits (torchao, langdetect, zmq, jsonschema,
+    # pymongo, modelscope). Install both so neither set is missing.
+    #
+    # One line has to be filtered out: requirements.txt still asks for
+    # `sgl-kernel`, which was renamed to `sglang-kernel` upstream. The old name
+    # is frozen at 0.3.21 while the new one is on 0.4.x, and BOTH install the
+    # same `sgl_kernel` module -- so letting requirements.txt pull the stale one
+    # would fight with the version installed by --quant sgl. Upstream's own
+    # cu130 image already uses the new name.
     run_sh "${PIP} install -v -e '${REPO_ROOT}'"
-    run_sh "${PIP} install -r '${REPO_ROOT}/requirements.txt'"
-    ok "core (pyproject + requirements.txt)"
+    local req="${BUILD_DIR}/requirements.filtered.txt"
+    run mkdir -p "${BUILD_DIR}"
+    run_sh "grep -v -E '^[[:space:]]*sgl-kernel([[:space:]]|==|>=|<=|$)' '${REPO_ROOT}/requirements.txt' > '${req}'"
+    run_sh "${PIP} install -r '${req}'"
+    ok "core (pyproject + requirements.txt, minus the renamed sgl-kernel)"
 }
 
 # ----------------------------------------------------------------------------
@@ -333,13 +364,21 @@ install_quant() {
     for backend in "${backends[@]}"; do
         case "${backend}" in
             sgl)
-                # Also gives LightX2V its default fused RMSNorm (rms_norm_type
-                # "sgl-kernel"); without it that path silently falls back to
-                # a slower pure-torch implementation.
-                run_sh "${PIP} install --upgrade sgl-kernel"
-                ok "sgl-kernel (fp8-sgl / int8-sgl + fused RMSNorm)" ;;
+                # Package renamed: `sgl-kernel` (stuck at 0.3.21) -> `sglang-kernel`
+                # (0.4.x). Both provide the `sgl_kernel` module. Pinned to the
+                # version upstream's cu130 image validates against torch 2.11;
+                # override with SGLANG_KERNEL_VERSION (latest is newer).
+                #
+                # This also backs LightX2V's default fused RMSNorm
+                # (rms_norm_type "sgl-kernel"), not just the fp8/int8 GEMMs --
+                # without it that path silently drops to pure torch.
+                run_sh "${PIP} install 'sglang-kernel==${SGLANG_KERNEL_VERSION:-0.4.4}'"
+                ok "sglang-kernel (fp8-sgl / int8-sgl + fused RMSNorm)" ;;
             vllm)
-                run_sh "${PIP} install vllm"
+                # Pinned to upstream's cu130 image; bare `pip install vllm`
+                # pulls a much newer release that has not been tried against
+                # this torch. Override with VLLM_VERSION.
+                run_sh "${PIP} install 'vllm==${VLLM_VERSION:-0.23.0}'"
                 ok "vllm kernels (fp8-vllm / int8-vllm)" ;;
             torchao)
                 run_sh "${PIP} install torchao"
