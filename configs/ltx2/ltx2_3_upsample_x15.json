@@ -4,7 +4,7 @@
     "target_video_length": 241,
     "target_height": 960,
     "target_width": 1440,
-    "attn_type": "sage_attn2",
+    "attn_type": "flash_attn4",
     "sample_guide_scale": 1,
     "sample_shift": [2.05, 0.95],
     "enable_cfg": false,

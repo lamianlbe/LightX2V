@@ -441,7 +441,11 @@ def main() -> int:
         "target_video_length": 241,
         "target_height": 1024,
         "target_width": 1536,
-        "attn_type": "sage_attn2",
+        # flash_attn4 spans every GPU this branch targets (Hopper + Blackwell),
+        # whereas sage_attn2 has no sm100/sm103 kernels and would not load on
+        # B200/B300. Batch size is 1 and sequences are packed, so FA4's
+        # bs==1 / no-varlen restriction does not bite here.
+        "attn_type": "flash_attn4",
         "sample_guide_scale": 1,
         "sample_shift": [2.05, 0.95],
         "enable_cfg": False,

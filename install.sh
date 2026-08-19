@@ -21,11 +21,15 @@
 # the GPU. This script picks a working set for the detected hardware and tells
 # you what it skipped and why.
 #
-# Everything the script installs beyond the core is optional at runtime:
-# LightX2V falls back to torch_sdpa attention and a pure-torch RMSNorm when the
-# accelerated kernels are missing. The one thing to know is that the shipped
-# configs ask for attn_type=sage_attn2, which does NOT degrade gracefully -- if
-# you skip attention operators, set attn_type=torch_sdpa in your config.
+# Everything the script installs beyond the core is optional at runtime, with
+# one exception: RMSNorm falls back to pure torch when sgl-kernel is absent,
+# but attention does NOT degrade -- the registry hands back a None kernel and
+# the call fails. So whatever attn_type your config names has to be installed.
+#
+# Configs added on this branch use attn_type=flash_attn4, which works on every
+# GPU here. Upstream's stock LTX-2 configs still say sage_attn2, which will not
+# load on B200/B300; switch those to flash_attn4, or to torch_sdpa if you ran
+# with --minimal and have no operators at all.
 
 set -euo pipefail
 
